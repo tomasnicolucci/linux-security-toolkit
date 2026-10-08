@@ -12,21 +12,40 @@ def generate_password(
     if length < 8:
         raise ValueError("Password length must be at least 8 characters.")
 
-    characters = ""
+    character_groups = []
 
     if use_uppercase:
-        characters += string.ascii_uppercase
+        character_groups.append(string.ascii_uppercase)
 
     if use_lowercase:
-        characters += string.ascii_lowercase
+        character_groups.append(string.ascii_lowercase)
 
     if use_digits:
-        characters += string.digits
+        character_groups.append(string.digits)
 
     if use_symbols:
-        characters += string.punctuation
+        character_groups.append(string.punctuation)
 
-    if not characters:
+    if not character_groups:
         raise ValueError("At least one character type must be enabled.")
 
-    return "".join(secrets.choice(characters) for _ in range(length))
+    if length < len(character_groups):
+        raise ValueError(
+            "Password length must be at least the number of selected character types."
+        )
+
+    password = [
+        secrets.choice(group)
+        for group in character_groups
+    ]
+
+    all_characters = "".join(character_groups)
+
+    password.extend(
+        secrets.choice(all_characters)
+        for _ in range(length - len(password))
+    )
+
+    secrets.SystemRandom().shuffle(password)
+
+    return "".join(password)

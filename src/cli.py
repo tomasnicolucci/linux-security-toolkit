@@ -1,6 +1,6 @@
 import argparse
 
-from src.password.generator import generate_password
+from src.password.cli import register_password_commands
 
 
 def main() -> None:
@@ -9,27 +9,15 @@ def main() -> None:
         description="Linux Security Toolkit",
     )
 
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    password_parser = commands.add_parser("password")
-    password_commands = password_parser.add_subparsers(
-        dest="password_command",
+    commands = parser.add_subparsers(
+        dest="command",
         required=True,
     )
 
-    generate_parser = password_commands.add_parser("generate")
-
-    generate_parser.add_argument(
-        "--length",
-        type=int,
-        default=16,
-    )
+    register_password_commands(commands)
 
     args = parser.parse_args()
-
-    if args.command == "password" and args.password_command == "generate":
-        password = generate_password(length=args.length)
-        print(password)
+    args.func(args)
 
 
 if __name__ == "__main__":
