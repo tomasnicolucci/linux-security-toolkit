@@ -1,0 +1,3 @@
+services:
+  security-toolkit:
+    build: .
