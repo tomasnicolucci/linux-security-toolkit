@@ -1,7 +1,10 @@
 
 import argparse
+import getpass
+import sys
 
 from src.password.generator import generate_password
+from src.password.analyzer import analyze_password
 
 
 def ask_length(default: int = 16) -> int:
@@ -79,6 +82,43 @@ def handle_generate(args: argparse.Namespace) -> None:
     print(f"\nGenerated password:\n{password}")
 
 
+def handle_analyze(args: argparse.Namespace) -> None:
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Error: Interactive terminal required for password analysis."
+        )
+
+    try:
+        password = getpass.getpass("Enter password to analyze: ")
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\nPassword analysis cancelled.")
+
+    try:
+        result = analyze_password(password)
+    except ValueError as error:
+        raise SystemExit(f"Error: {error}") from error
+
+    print("\nPassword Analysis")
+    print("-----------------")
+    print(f"Length: {result.length}")
+    print(f"Score: {result.score}/4")
+    print(f"Strength: {result.strength}")
+    print(f"Estimated guesses: {result.guesses:,}")
+    print(f"Estimated crack time: {result.crack_time}")
+
+    if result.warnings:
+        print("\nWarnings:")
+        for warning in result.warnings:
+            print(f"- {warning}")
+
+    if result.recommendations:
+        print("\nRecommendations:")
+        for recommendation in result.recommendations:
+            print(f"- {recommendation}")
+    else:
+        print("\nNo obvious weaknesses detected.")
+
+
 def register_password_commands(commands) -> None:
     password_parser = commands.add_parser(
         "password",
@@ -122,3 +162,10 @@ def register_password_commands(commands) -> None:
     )
 
     generate_parser.set_defaults(func=handle_generate)
+
+    analyze_parser = password_commands.add_parser(
+        "analyze",
+        help="Analyze password strength",
+    )
+
+    analyze_parser.set_defaults(func=handle_analyze)
