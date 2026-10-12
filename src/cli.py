@@ -1,6 +1,7 @@
 import argparse
 
 from src.password.cli import register_password_commands
+from src.url.cli import register_url_commands
 
 
 def main() -> None:
@@ -15,6 +16,7 @@ def main() -> None:
     )
 
     register_password_commands(commands)
+    register_url_commands(commands)
 
     args = parser.parse_args()
     args.func(args)
