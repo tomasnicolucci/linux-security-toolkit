@@ -1,3 +1,7 @@
 services:
   security-toolkit:
     build: .
+    volumes:
+      - ./data:/app/data
+      - ./samples:/app/samples:ro
+      - /etc/ssh:/host/etc/ssh:ro

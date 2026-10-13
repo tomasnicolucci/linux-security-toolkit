@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "created_at": "2026-10-12T22:50:58.239655+00:00",
+  "target": "/app/samples",
+  "recursive": true,
+  "exclusions": [],
+  "files": {
+    "config.txt": {
+      "sha256": "97ae9a0e48905a3c1497aeaa79e48c775fdcd207cc3a1a362e3cb5a76975e143",
+      "size": 10,
+      "modified_ns": 1791845376911411400,
+      "permissions": "-rwxrwxrwx"
+    }
+  }
+}
