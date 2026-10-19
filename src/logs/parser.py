@@ -1,8 +1,7 @@
-
 import ipaddress
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from typing import Any
 
 from src.logs.models import EventType, SecurityEvent
@@ -37,6 +36,8 @@ MONTHS = {
     "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9,
     "Oct": 10, "Nov": 11, "Dec": 12,
+    # Abreviaturas en español que no coinciden con las inglesas.
+    "Ene": 1, "Abr": 4, "Ago": 8, "Dic": 12,
 }
 
 SSH_FAILED = re.compile(
@@ -134,7 +135,10 @@ def normalize_ip(value: str | None) -> str | None:
         return None
 
 
-def parse_timestamp(value: str) -> datetime:
+def parse_timestamp(
+    value: str,
+    tz: tzinfo = timezone.utc,
+) -> datetime:
     normalized = value.replace(",", ".")
 
     if normalized.endswith("Z"):
@@ -150,8 +154,10 @@ def parse_timestamp(value: str) -> datetime:
 
     timestamp = datetime.fromisoformat(normalized)
 
+    # Un timestamp sin offset se interpreta en la zona horaria
+    # configurada, igual que los timestamps syslog tradicionales.
     if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp = timestamp.replace(tzinfo=tz)
 
     return timestamp.astimezone(timezone.utc)
 
@@ -161,18 +167,26 @@ def parse_syslog_timestamp(
     day: str,
     time_value: str,
     year: int,
+    tz: tzinfo = timezone.utc,
 ) -> datetime:
+    month_number = MONTHS.get(month)
+
+    if month_number is None:
+        raise ValueError(f"Unknown month abbreviation: {month}")
+
     hour, minute, second = map(int, time_value.split(":"))
 
-    return datetime(
+    local_time = datetime(
         year,
-        MONTHS[month],
+        month_number,
         int(day),
         hour,
         minute,
         second,
-        tzinfo=timezone.utc,
+        tzinfo=tz,
     )
+
+    return local_time.astimezone(timezone.utc)
 
 
 def parse_journal_json(content: str) -> dict[str, Any] | None:
@@ -361,6 +375,7 @@ def extract_event_details(
 def parse_log_line(
     log_line: LogLine,
     year: int | None = None,
+    tz: tzinfo = timezone.utc,
 ) -> SecurityEvent | None:
     content = log_line.content.strip()
 
@@ -378,7 +393,8 @@ def parse_log_line(
         if match:
             parsed = {
                 "timestamp": parse_timestamp(
-                    match.group("timestamp")
+                    match.group("timestamp"),
+                    tz,
                 ),
                 "hostname": match.group("hostname"),
                 "service": match.group("service"),
@@ -404,6 +420,7 @@ def parse_log_line(
                     match.group("day"),
                     match.group("time"),
                     selected_year,
+                    tz,
                 ),
                 "hostname": match.group("hostname"),
                 "service": match.group("service"),

@@ -87,4 +87,5 @@ class AnalysisResult:
     lines_unparsed: int = 0
 
     errors: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     statistics: dict[str, Any] = field(default_factory=dict)

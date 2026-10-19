@@ -1,7 +1,4 @@
-
 import argparse
-from dataclasses import replace
-from datetime import timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +18,7 @@ from src.logs.ip_history import (
     save_known_ips,
 )
 from src.logs.models import AnalysisResult
-from src.logs.parser import SYSLOG_PATTERN, parse_log_line
+from src.logs.parser import parse_log_line
 from src.logs.reader import discover_log_files, read_log_lines
 from src.logs.reporter import export_json, print_report, summarize
 
@@ -164,6 +161,7 @@ def analyze_logs(
     )
 
     parsed_events = []
+    local_timezone = ZoneInfo(config.timezone)
 
     for path in discovered.files:
         try:
@@ -174,27 +172,12 @@ def analyze_logs(
                     event = parse_log_line(
                         line,
                         year=args.year,
+                        tz=local_timezone,
                     )
 
                     if event is None:
                         result.lines_unparsed += 1
                         continue
-
-                    if SYSLOG_PATTERN.match(line.content):
-                        local_time = (
-                            event.timestamp
-                            .replace(tzinfo=None)
-                            .replace(
-                                tzinfo=ZoneInfo(config.timezone)
-                            )
-                        )
-
-                        event = replace(
-                            event,
-                            timestamp=local_time.astimezone(
-                                timezone.utc
-                            ),
-                        )
 
                     parsed_events.append(event)
 
@@ -226,6 +209,16 @@ def analyze_logs(
     known_ips = load_known_ips(
         Path(config.ip_history_path)
     )
+
+    if (
+        known_ips is None
+        and "new_source_ip" in config.enabled_rules
+    ):
+        result.warnings.append(
+            "No approved IP baseline found at "
+            f"{config.ip_history_path}; rule 'new_source_ip' "
+            "was skipped. Run 'logs ips init' to create one."
+        )
 
     detectors = (
         detect_brute_force,

@@ -1,4 +1,3 @@
-
 from collections import defaultdict
 from datetime import timedelta
 from typing import Callable, Hashable, TypeVar
@@ -169,23 +168,33 @@ def find_event_windows(
     active_start = None
     active_end = None
 
+    # Contador de valores distintos dentro de la ventana actual.
+    # Se actualiza al entrar/salir cada evento, evitando copiar
+    # la ventana completa en cada iteración (costo lineal).
+    distinct_counts: dict[Hashable, int] = {}
+
     for right, event in enumerate(ordered):
+        if distinct_key is not None:
+            key = distinct_key(event)
+            distinct_counts[key] = distinct_counts.get(key, 0) + 1
+
         while (
-            left <= right
-            and event.timestamp - ordered[left].timestamp
+            event.timestamp - ordered[left].timestamp
             > duration
         ):
+            if distinct_key is not None:
+                old_key = distinct_key(ordered[left])
+                distinct_counts[old_key] -= 1
+
+                if distinct_counts[old_key] == 0:
+                    del distinct_counts[old_key]
+
             left += 1
 
-        current_window = ordered[left:right + 1]
-
         if distinct_key is None:
-            count = len(current_window)
+            count = right - left + 1
         else:
-            count = len({
-                distinct_key(item)
-                for item in current_window
-            })
+            count = len(distinct_counts)
 
         if count >= threshold:
             if active_start is None:

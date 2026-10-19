@@ -56,6 +56,8 @@ def print_report(result: AnalysisResult) -> None:
         print(f"Unparsed lines: {result.lines_unparsed}")
     for source, error in result.errors.items():
         print(f"[ERROR] {source}: {error}")
+    for warning in result.warnings:
+        print(f"[WARNING] {warning}")
     for finding in sorted(result.findings, key=lambda f: (f.first_seen, f.rule_id)):
         print(f"[{finding.severity.value}] {finding.title} | {finding.first_seen.isoformat()} | IP={finding.source_ip or '-'} | user={finding.username or '-'} | events={finding.event_count}")
         print(f"  {finding.description}")
