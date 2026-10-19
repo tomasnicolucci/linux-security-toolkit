@@ -4,4 +4,5 @@ services:
     volumes:
       - ./data:/app/data
       - ./samples:/app/samples:ro
+      - ./config.yaml:/app/config.yaml:ro
       - /etc/ssh:/host/etc/ssh:ro

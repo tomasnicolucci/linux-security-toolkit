@@ -1,0 +1,13 @@
+Oct 18 10:00:00 server sshd[1001]: Failed password for root from 203.0.113.25 port 50001 ssh2
+Oct 18 10:01:00 server sshd[1002]: Failed password for root from 203.0.113.25 port 50002 ssh2
+Oct 18 10:02:00 server sshd[1003]: Failed password for root from 203.0.113.25 port 50003 ssh2
+Oct 18 10:03:00 server sshd[1004]: Failed password for root from 203.0.113.25 port 50004 ssh2
+Oct 18 10:04:00 server sshd[1005]: Failed password for root from 203.0.113.25 port 50005 ssh2
+Oct 18 10:05:00 server sshd[1006]: Accepted password for root from 203.0.113.25 port 50006 ssh2
+Oct 18 10:06:00 server sudo[1100]: alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/id
+Oct 18 10:07:00 server useradd[1101]: new user: name=deploy, UID=1002, GID=1002
+Oct 18 10:08:00 server systemd[1]: Failed to start backup.service
+Oct 18 10:09:00 server systemd[1]: Failed to start backup.service
+Oct 18 10:10:00 server systemd[1]: Failed to start backup.service
+Oct 18 10:11:00 server systemd[1]: Failed to start backup.service
+Oct 18 10:12:00 server systemd[1]: Failed to start backup.service

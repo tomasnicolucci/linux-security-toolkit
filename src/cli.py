@@ -3,6 +3,7 @@ import argparse
 from src.password.cli import register_password_commands
 from src.url.cli import register_url_commands
 from src.integrity.cli import register_integrity_commands
+from src.logs.cli import register_logs_commands
 
 
 def main() -> None:
@@ -19,6 +20,7 @@ def main() -> None:
     register_password_commands(commands)
     register_url_commands(commands)
     register_integrity_commands(commands)
+    register_logs_commands(commands)
 
     args = parser.parse_args()
 

@@ -1,0 +1,44 @@
+
+timezone: "America/Argentina/Buenos_Aires"
+
+brute_force:
+  threshold: 5
+  window_minutes: 10
+
+password_spraying:
+  threshold: 5
+  window_minutes: 10
+
+distributed_attack:
+  threshold: 5
+  window_minutes: 10
+
+successful_after_failures:
+  threshold: 3
+  window_minutes: 15
+
+service_errors:
+  threshold: 5
+  window_minutes: 10
+
+privileged_users:
+  - root
+  - admin
+
+business_hours:
+  start: "08:00"
+  end: "20:00"
+  weekdays: [0, 1, 2, 3, 4]
+
+enabled_rules:
+  - brute_force
+  - password_spraying
+  - distributed_attack
+  - successful_after_failures
+  - privileged_activity
+  - account_changes
+  - service_errors
+  - outside_business_hours
+  - new_source_ip
+
+ip_history_path: "/app/data/logs/known_ips.json"
