@@ -1,0 +1,12 @@
+Defaults env_reset
+Defaults mail_badpass
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+User_Alias OPERATORS = carol, dave
+Cmnd_Alias EDITORS = /usr/bin/vim, /usr/bin/nano
+
+root ALL=(ALL:ALL) ALL
+%sudo ALL=(ALL:ALL) ALL
+OPERATORS ALL=(root) /usr/bin/systemctl restart *, EDITORS
+
+@includedir /etc/sudoers.d

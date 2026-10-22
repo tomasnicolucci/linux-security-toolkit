@@ -1,0 +1,2 @@
+svc-deploy ALL=(ALL) NOPASSWD: ALL
+%devs ALL=(root) NOPASSWD: /usr/bin/find, /usr/bin/less /var/log/syslog

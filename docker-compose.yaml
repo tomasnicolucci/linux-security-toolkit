@@ -1,8 +1,21 @@
 services:
   security-toolkit:
     build: .
+    image: linux-security-toolkit
     volumes:
       - ./data:/app/data
       - ./samples:/app/samples:ro
       - ./config.yaml:/app/config.yaml:ro
       - /etc/ssh:/host/etc/ssh:ro
+
+  user-auditor:
+    build: .
+    image: linux-security-toolkit
+    entrypoint: ["bash", "/app/src/users/user_auditor.sh"]
+    volumes:
+      - ./data:/app/data
+      - ./samples:/app/samples:ro
+      - /etc:/host/etc:ro
+      # Optional, to check home directories with --check-homes:
+      # - /home:/host/home:ro
+      # - /root:/host/root:ro
