@@ -5,6 +5,7 @@ from src.url.cli import register_url_commands
 from src.integrity.cli import register_integrity_commands
 from src.ip.cli import register_ip_commands
 from src.logs.cli import register_logs_commands
+from src.statistics.cli import register_stats_commands
 
 
 def main() -> None:
@@ -23,6 +24,7 @@ def main() -> None:
     register_integrity_commands(commands)
     register_logs_commands(commands)
     register_ip_commands(commands)
+    register_stats_commands(commands)
 
     args = parser.parse_args()
 
