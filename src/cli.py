@@ -6,6 +6,7 @@ from src.encryption.cli import register_encryption_commands
 from src.integrity.cli import register_integrity_commands
 from src.ip.cli import register_ip_commands
 from src.logs.cli import register_logs_commands
+from src.network.cli import register_network_commands
 from src.statistics.cli import register_stats_commands
 
 
@@ -27,6 +28,7 @@ def main() -> None:
     register_ip_commands(commands)
     register_stats_commands(commands)
     register_encryption_commands(commands)
+    register_network_commands(commands)
 
     args = parser.parse_args()
 

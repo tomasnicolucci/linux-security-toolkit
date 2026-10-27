@@ -19,3 +19,14 @@ services:
       # Optional, to check home directories with --check-homes:
       # - /home:/host/home:ro
       # - /root:/host/root:ro
+
+  network-monitor:
+    build: .
+    image: linux-security-toolkit
+    entrypoint: ["python", "-m", "src.network"]
+    network_mode: host
+    pid: host
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - ./data:/app/data
