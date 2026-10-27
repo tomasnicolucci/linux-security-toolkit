@@ -3,3 +3,4 @@ idna>=3.7,<4
 tldextract>=5.1,<6
 PyYAML>=6.0,<7
 tzdata>=2025.1
+cryptography>=46,<47
