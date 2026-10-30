@@ -30,3 +30,9 @@ services:
       - SYS_PTRACE
     volumes:
       - ./data:/app/data
+
+  tests:
+    build:
+      context: .
+      target: test
+    image: linux-security-toolkit-test
