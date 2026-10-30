@@ -1,316 +1,443 @@
-import argparse
-import contextlib
-import io
+import http.server
 import json
-import stat
+import socketserver
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from src.integrity import cli as integrity_cli
-from src.integrity.baseline import (
-    create_baseline_data,
-    load_baseline,
-    save_json,
+from src.ip import lookup
+from src.ip.analyzer import analyze_address, analyze_addresses
+from src.ip.classifier import canonical_address, classify, parse_address
+from src.ip.lookup import RdapError, lookup_rdap, parse_rdap, reverse_dns
+from src.ip.models import AddressEntry
+from src.ip.sources import (
+    build_entries,
+    read_address_file,
+    read_report_entries,
 )
-from src.integrity.checker import compare_integrity
-from src.integrity.hasher import calculate_sha256
-from src.integrity.scanner import is_excluded, scan_target
-from tests.helpers import requires_linux
-
-EMPTY_SHA256 = (
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-)
+from src.ip.text import clean_text
+from tests.helpers import run_cli
 
 
-class TemporaryDirectoryTestCase(unittest.TestCase):
+class ClassifierTests(unittest.TestCase):
+    def test_categories(self):
+        expected = {
+            "8.8.8.8": ("global", True),
+            "10.1.2.3": ("private", False),
+            "172.16.0.1": ("private", False),
+            "192.168.1.1": ("private", False),
+            "127.0.0.1": ("loopback", False),
+            "169.254.1.1": ("link_local", False),
+            "100.64.0.5": ("carrier_grade_nat", False),
+            "203.0.113.25": ("documentation", False),
+            "198.18.0.1": ("benchmarking", False),
+            "224.0.0.1": ("multicast", False),
+            "0.0.0.0": ("unspecified", False),
+            "255.255.255.255": ("broadcast", False),
+            "240.0.0.1": ("reserved", False),
+            "::1": ("loopback", False),
+            "fe80::1": ("link_local", False),
+            "fc00::1": ("private", False),
+            "2001:db8::1": ("documentation", False),
+            "ff02::1": ("multicast", False),
+            "2606:4700:4700::1111": ("global", True),
+        }
+
+        for address, (category, is_global) in expected.items():
+            with self.subTest(address=address):
+                result = classify(address)
+
+                self.assertEqual(result.category, category)
+                self.assertEqual(result.is_global, is_global)
+
+    def test_versions_and_reverse_pointer(self):
+        self.assertEqual(classify("1.2.3.4").version, 4)
+        self.assertEqual(classify("1.2.3.4").reverse_pointer, "4.3.2.1.in-addr.arpa")
+        self.assertEqual(classify("2001:db8::1").version, 6)
+
+    def test_ipv4_mapped_addresses_are_unwrapped(self):
+        result = classify("::ffff:8.8.4.4")
+
+        self.assertEqual(result.address, "8.8.4.4")
+        self.assertEqual(result.version, 4)
+        self.assertTrue(result.is_global)
+        self.assertTrue(result.notes)
+
+    def test_scope_identifier_is_ignored(self):
+        self.assertEqual(classify("fe80::1%eth0").category, "link_local")
+
+    def test_invalid_addresses(self):
+        for value in ("999.1.1.1", "abc", "", "  ", "1.2.3", "1.2.3.4/24"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    classify(value)
+
+    def test_canonical_form_is_used_to_find_duplicates(self):
+        self.assertEqual(canonical_address("::ffff:1.2.3.4"), "1.2.3.4")
+        self.assertEqual(canonical_address("2001:0db8:0:0:0:0:0:1"), "2001:db8::1")
+        self.assertIsNone(canonical_address("nope"))
+        self.assertEqual(str(parse_address(" 10.0.0.1 ")), "10.0.0.1")
+
+
+class TextTests(unittest.TestCase):
+    def test_control_characters_are_removed(self):
+        self.assertEqual(clean_text("a\x1b[31mred\x00\n b"), "a [31mred b")
+
+    def test_limits_and_types(self):
+        self.assertEqual(len(clean_text("x" * 500)), 200)
+        self.assertIsNone(clean_text(5))
+        self.assertIsNone(clean_text("   \t"))
+
+
+class SourceTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
-    def write(self, relative, content="data"):
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+    def test_address_file_ignores_comments_and_blank_lines(self):
+        path = self.root / "ips.txt"
+        path.write_text("# header\n8.8.8.8   # google\n\n10.0.0.5\n")
+
+        self.assertEqual(read_address_file(str(path)), ["8.8.8.8", "10.0.0.5"])
+
+    def test_address_file_errors(self):
+        with self.assertRaises(ValueError):
+            read_address_file(str(self.root / "missing.txt"))
+
+    def test_standard_input(self):
+        with mock.patch("src.ip.sources.sys.stdin") as stdin:
+            stdin.read.return_value = "1.1.1.1\n2.2.2.2\n"
+
+            self.assertEqual(read_address_file("-"), ["1.1.1.1", "2.2.2.2"])
+
+    def report(self, findings):
+        path = self.root / "report.json"
+        path.write_text(json.dumps({"findings": findings}))
         return path
 
+    def test_report_entries_are_ordered_by_severity(self):
+        entries = read_report_entries(self.report([
+            {"rule_id": "brute_force", "severity": "MEDIUM", "source_ip": "198.51.100.7"},
+            {"rule_id": "spraying", "severity": "MEDIUM", "source_ip": "198.51.100.7"},
+            {"rule_id": "new_source_ip", "severity": "LOW", "source_ip": "10.0.0.5"},
+            {
+                "rule_id": "distributed_attack",
+                "severity": "HIGH",
+                "source_ip": None,
+                "metadata": {"source_ips": ["192.0.2.1", "192.0.2.2"]},
+            },
+        ]))
 
-class HasherTests(TemporaryDirectoryTestCase):
-    def test_known_digests(self):
-        empty = self.write("empty", "")
-        abc = self.write("abc", "abc")
-
-        self.assertEqual(calculate_sha256(empty), EMPTY_SHA256)
         self.assertEqual(
-            calculate_sha256(abc),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            [entry.raw for entry in entries],
+            ["192.0.2.1", "192.0.2.2", "198.51.100.7", "10.0.0.5"],
         )
+        top = entries[2].context
 
-    def test_large_files_are_read_in_chunks(self):
-        path = self.root / "big"
-        path.write_bytes(b"x" * (3 * 1024 * 1024 + 5))
+        self.assertEqual((top.findings, top.max_severity), (2, "MEDIUM"))
+        self.assertEqual(top.rules, ("brute_force", "spraying"))
 
-        self.assertEqual(len(calculate_sha256(path)), 64)
-
-
-class ScannerTests(TemporaryDirectoryTestCase):
-    def test_exclusion_patterns(self):
-        self.assertTrue(is_excluded("a/b/file.log", ["*.log"]))
-        self.assertTrue(is_excluded("a/cache/x", ["cache"]))
-        self.assertFalse(is_excluded("a/b/file.txt", ["*.log"]))
-
-    def test_non_recursive_scan_ignores_subdirectories(self):
-        self.write("top.txt")
-        self.write("sub/inner.txt")
-
-        result = scan_target(self.root)
-
-        self.assertEqual(set(result.files), {"top.txt"})
-        self.assertEqual(result.errors, {})
-
-    def test_recursive_scan_with_exclusions(self):
-        self.write("top.txt")
-        self.write("sub/inner.txt")
-        self.write("sub/skip.log")
-        self.write("cache/data.txt")
-
-        result = scan_target(
-            self.root,
-            recursive=True,
-            exclusions=["*.log", "cache"],
-        )
-
-        self.assertEqual(set(result.files), {"top.txt", "sub/inner.txt"})
-
-    def test_records_hash_size_and_permissions(self):
-        path = self.write("file.txt", "abc")
-        path.chmod(0o640)
-
-        record = scan_target(self.root).files["file.txt"]
-
-        self.assertEqual(record["size"], 3)
-        self.assertEqual(
-            record["permissions"],
-            stat.filemode(path.stat().st_mode),
-        )
-        self.assertEqual(len(record["sha256"]), 64)
-
-    def test_single_file_target(self):
-        path = self.write("one.txt")
-
-        result = scan_target(path)
-
-        self.assertEqual(set(result.files), {"one.txt"})
-
-    def test_rejects_invalid_targets(self):
-        with self.assertRaises(ValueError):
-            scan_target(self.root / "missing")
-
-    @requires_linux
-    def test_symbolic_links_are_never_followed(self):
-        target = self.write("real.txt")
-        (self.root / "link.txt").symlink_to(target)
-        (self.root / "linkdir").symlink_to(self.root, target_is_directory=True)
-
-        result = scan_target(self.root, recursive=True)
-
-        self.assertEqual(set(result.files), {"real.txt"})
-        self.assertIn("link.txt", result.errors)
+    def test_invalid_reports(self):
+        path = self.root / "bad.json"
+        path.write_text(json.dumps({"events": []}))
 
         with self.assertRaises(ValueError):
-            scan_target(self.root / "link.txt")
+            read_report_entries(path)
 
+        with self.assertRaises(ValueError):
+            read_report_entries(self.root / "missing.json")
 
-class CheckerTests(TemporaryDirectoryTestCase):
-    def test_detects_every_kind_of_change(self):
-        for name in ("same", "changed", "removed", "perm"):
-            self.write(name, name)
+    def test_entries_are_merged_and_limited(self):
+        report = [AddressEntry("1.1.1.1", ["report"])]
 
-        baseline = scan_target(self.root).files
-
-        self.write("changed", "different content")
-        (self.root / "removed").unlink()
-        (self.root / "perm").chmod(0o600)
-        self.write("new", "new")
-
-        report = compare_integrity(baseline, scan_target(self.root))
-
-        self.assertEqual(report.unchanged, ["same"])
-        self.assertEqual(report.modified, ["changed", "perm"])
-        self.assertEqual(report.added, ["new"])
-        self.assertEqual(report.deleted, ["removed"])
-        self.assertEqual(report.to_dict()["summary"]["modified"], 2)
-
-    def test_files_with_errors_are_not_reported_as_deleted(self):
-        self.write("a.txt")
-        baseline = scan_target(self.root).files
-        current = scan_target(self.root)
-        current.files.clear()
-        current.errors["a.txt"] = "Permission denied"
-
-        report = compare_integrity(baseline, current)
-
-        self.assertEqual(report.deleted, [])
-        self.assertEqual(report.errors, {"a.txt": "Permission denied"})
-
-    def test_everything_under_an_unreadable_directory_is_not_deleted(self):
-        self.write("locked/a.txt")
-        baseline = scan_target(self.root, recursive=True).files
-        current = scan_target(self.root, recursive=True)
-        current.files.clear()
-        current.errors["locked"] = "Permission denied"
-
-        self.assertEqual(compare_integrity(baseline, current).deleted, [])
-
-
-class BaselineFileTests(TemporaryDirectoryTestCase):
-    def valid(self):
-        return create_baseline_data(self.root, True, ["*.log"], {})
-
-    def test_round_trip(self):
-        path = self.root / "out" / "baseline.json"
-
-        save_json(path, self.valid())
-        loaded = load_baseline(path)
-
-        self.assertEqual(loaded["recursive"], True)
-        self.assertEqual(loaded["exclusions"], ["*.log"])
-        self.assertEqual(loaded["target"], str(self.root.absolute()))
-
-    @requires_linux
-    def test_file_is_private_and_no_temporary_files_remain(self):
-        path = self.root / "baseline.json"
-
-        save_json(path, self.valid())
-
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(
-            [item.name for item in self.root.iterdir()],
-            ["baseline.json"],
+        entries, warnings = build_entries(
+            ["1.1.1.1", "::ffff:2.2.2.2"],
+            ["2.2.2.2", "3.3.3.3"],
+            report,
+            limit=3,
         )
 
-    def test_rejects_invalid_content(self):
-        valid = self.valid()
-        broken = {
-            "not an object": [],
-            "wrong version": {**valid, "version": 99},
-            "files not an object": {**valid, "files": []},
-            "target missing": {**valid, "target": None},
-            "recursive not boolean": {**valid, "recursive": "yes"},
-            "bad exclusions": {**valid, "exclusions": [1]},
-        }
+        self.assertEqual([entry.raw for entry in entries], ["1.1.1.1", "::ffff:2.2.2.2", "3.3.3.3"])
+        self.assertEqual(entries[0].sources, ["argument", "report"])
+        self.assertEqual(warnings, [])
 
-        for name, data in broken.items():
-            with self.subTest(name):
-                path = self.root / "bad.json"
-                path.write_text(json.dumps(data))
+        _, warnings = build_entries(["1.1.1.1", "2.2.2.2", "3.3.3.3"], [], [], limit=2)
 
-                with self.assertRaises(ValueError):
-                    load_baseline(path)
+        self.assertIn("1 additional", warnings[0])
 
 
-class CommandTests(TemporaryDirectoryTestCase):
+ARIN_RESPONSE = {
+    "name": "GOGL",
+    "handle": "NET-8-8-8-0-2",
+    "startAddress": "8.8.8.0",
+    "endAddress": "8.8.8.255",
+    "cidr0_cidrs": [{"v4prefix": "8.8.8.0", "length": 24}],
+    "entities": [{
+        "roles": ["registrant"],
+        "vcardArray": ["vcard", [["fn", {}, "text", "Google LLC"]]],
+        "entities": [{
+            "roles": ["abuse"],
+            "vcardArray": ["vcard", [["email", {}, "text", "network-abuse@google.com"]]],
+        }],
+    }],
+}
+
+RIPE_RESPONSE = {
+    "name": "EXAMPLE\x1b[31m-NET",
+    "startAddress": "193.0.0.0",
+    "endAddress": "193.0.7.255",
+    "country": "NL",
+    "entities": [{
+        "roles": ["abuse"],
+        "vcardArray": ["vcard", [["email", {}, "text", "abuse@example.net"]]],
+    }],
+}
+
+
+class RdapParsingTests(unittest.TestCase):
+    def test_nested_entities_and_cidr(self):
+        info = parse_rdap(ARIN_RESPONSE)
+
+        self.assertEqual(info.network_name, "GOGL")
+        self.assertEqual(info.cidrs, ("8.8.8.0/24",))
+        self.assertEqual(info.ip_range, "8.8.8.0 - 8.8.8.255")
+        self.assertEqual(info.organization, "Google LLC")
+        self.assertEqual(info.abuse_contact, "network-abuse@google.com")
+
+    def test_cidr_is_computed_from_the_range_and_text_is_sanitized(self):
+        info = parse_rdap(RIPE_RESPONSE)
+
+        self.assertEqual(info.country, "NL")
+        self.assertEqual(info.cidrs[0], "193.0.0.0/21")
+        self.assertNotIn("\x1b", info.network_name)
+
+    def test_unusable_or_hostile_data(self):
+        for data in (
+            {},
+            {"name": 5},
+            {"entities": "x", "cidr0_cidrs": [1, {"v4prefix": "x"}]},
+        ):
+            with self.subTest(data=data):
+                with self.assertRaises(RdapError):
+                    parse_rdap(data)
+
+        info = parse_rdap({
+            "name": "ok",
+            "startAddress": "1.1.1.1",
+            "endAddress": "garbage",
+            "entities": [None, {"roles": None}, {"roles": ["abuse"], "vcardArray": "x"}],
+        })
+
+        self.assertEqual(info.network_name, "ok")
+        self.assertIsNone(info.abuse_contact)
+
+    def test_lookup_uses_the_expected_url(self):
+        calls = []
+
+        def fetch(url, timeout):
+            calls.append((url, timeout))
+            return ARIN_RESPONSE
+
+        info = lookup_rdap("8.8.8.8", 4, fetch=fetch)
+
+        self.assertEqual(calls, [("https://rdap.org/ip/8.8.8.8", 4)])
+        self.assertEqual(info.handle, "NET-8-8-8-0-2")
+
+
+class ReverseDnsTests(unittest.TestCase):
+    def test_hostname_is_returned_and_sanitized(self):
+        with mock.patch("socket.gethostbyaddr", return_value=("host\x1b[2J.example.com", [], [])):
+            hostname, message = reverse_dns("1.2.3.4", 2)
+
+        self.assertEqual(hostname, "host [2J.example.com")
+        self.assertIsNone(message)
+
+    def test_missing_record(self):
+        import socket
+
+        with mock.patch("socket.gethostbyaddr", side_effect=socket.herror(1, "x")):
+            self.assertEqual(reverse_dns("1.2.3.4", 2), (None, "No PTR record found."))
+
+    def test_other_errors_do_not_raise(self):
+        with mock.patch("socket.gethostbyaddr", side_effect=OSError("network down")):
+            hostname, message = reverse_dns("1.2.3.4", 2)
+
+        self.assertIsNone(hostname)
+        self.assertIn("network down", message)
+
+    def test_slow_lookups_time_out(self):
+        with mock.patch("socket.gethostbyaddr", side_effect=lambda a: (time.sleep(2), ("late", [], []))[1]):
+            started = time.time()
+            hostname, message = reverse_dns("1.2.3.4", 0.3)
+
+        self.assertLess(time.time() - started, 2)
+        self.assertIsNone(hostname)
+        self.assertIn("timed out", message)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/x")
+            self.end_headers()
+            return
+
+        body = {
+            "/big": b"x" * (lookup.MAX_RESPONSE_BYTES + 10),
+            "/text": b"not json",
+            "/list": b"[1, 2]",
+            "/ok": b'{"name": "fine"}',
+        }.get(self.path, b"{}")
+
+        self.send_response(404 if self.path == "/missing" else 200)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class FetchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def fetch(self, path):
+        return lookup.fetch_json(self.base + path, 3)
+
+    def test_valid_response(self):
+        self.assertEqual(self.fetch("/ok"), {"name": "fine"})
+
+    def test_rejected_responses(self):
+        for path, text in (
+            ("/big", "too large"),
+            ("/text", "not valid JSON"),
+            ("/list", "Unexpected"),
+            ("/missing", "HTTP 404"),
+            ("/redirect", "HTTP 302"),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(RdapError) as context:
+                    self.fetch(path)
+
+                self.assertIn(text, str(context.exception))
+
+    def test_connection_failure(self):
+        with self.assertRaises(RdapError):
+            lookup.fetch_json("http://127.0.0.1:9/", 1)
+
+
+class AnalyzerTests(unittest.TestCase):
+    def analyze(self, address, **kwargs):
+        options = {"known_ips": None, "resolve": False, "rdap": False, "timeout": 2}
+        options.update(kwargs)
+
+        return analyze_address(AddressEntry(address, ["argument"]), **options)
+
+    def test_invalid_address(self):
+        result = self.analyze("nope")
+
+        self.assertIsNone(result.classification)
+        self.assertIn("Invalid", result.error)
+
+    def test_approval_status(self):
+        self.assertIsNone(self.analyze("8.8.8.8").approved)
+        self.assertTrue(self.analyze("8.8.8.8", known_ips={"8.8.8.8"}).approved)
+        self.assertFalse(self.analyze("8.8.8.8", known_ips={"1.1.1.1"}).approved)
+
+    def test_lookups_are_skipped_when_they_do_not_apply(self):
+        private = self.analyze("10.0.0.1", rdap=True)
+        multicast = self.analyze("224.0.0.1", resolve=True)
+
+        self.assertIn("Skipped", private.lookup_messages["rdap"])
+        self.assertIsNone(private.rdap)
+        self.assertIn("Skipped", multicast.lookup_messages["dns"])
+
+    def test_network_lookups_are_used_for_global_addresses(self):
+        with mock.patch("src.ip.analyzer.reverse_dns", return_value=("dns.google", None)), \
+                mock.patch("src.ip.analyzer.lookup_rdap", return_value="info"):
+            result = self.analyze("8.8.8.8", resolve=True, rdap=True)
+
+        self.assertEqual(result.hostname, "dns.google")
+        self.assertEqual(result.rdap, "info")
+
+    def test_lookup_failures_do_not_stop_the_analysis(self):
+        with mock.patch("src.ip.analyzer.lookup_rdap", side_effect=RdapError("boom")):
+            result = self.analyze("8.8.8.8", rdap=True)
+
+        self.assertEqual(result.lookup_messages["rdap"], "boom")
+        self.assertEqual(result.classification.category, "global")
+
+    def test_order_is_preserved_with_concurrent_lookups(self):
+        entries = [AddressEntry(f"8.8.8.{i}", ["argument"]) for i in range(1, 9)]
+
+        with mock.patch("src.ip.analyzer.reverse_dns", return_value=(None, "none")):
+            results = analyze_addresses(entries, None, True, False, 2)
+
+        self.assertEqual([r.input for r in results], [e.raw for e in entries])
+
+
+class CommandLineTests(unittest.TestCase):
     def setUp(self):
-        super().setUp()
-        self.data = self.root / "data"
-        self.target = self.root / "target"
-        self.target.mkdir()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
 
-        patcher = mock.patch.object(integrity_cli, "DATA_DIR", self.data)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def test_offline_analysis(self):
+        code, output = run_cli("ip", "analyze", "8.8.8.8", "10.0.0.5", "::ffff:1.2.3.4")
 
-    def run_command(self, handler, **kwargs):
-        output = io.StringIO()
-        code = 0
+        self.assertEqual(code, 0, output)
+        self.assertIn("8.8.8.8 | IPv4 | global", output)
+        self.assertIn("10.0.0.5 | IPv4 | private", output)
+        self.assertIn("1.2.3.4 | IPv4 | global", output)
 
-        with contextlib.redirect_stdout(output):
-            try:
-                handler(argparse.Namespace(**kwargs))
-            except SystemExit as error:
-                code = error.code
+    def test_invalid_input_gives_exit_code_2(self):
+        code, output = run_cli("ip", "analyze", "999.1.1.1")
 
-        return code, output.getvalue()
+        self.assertEqual(code, 2)
+        self.assertIn("[INVALID]", output)
 
-    def create(self, name="demo", **extra):
-        return self.run_command(
-            integrity_cli.handle_create,
-            target=str(self.target),
-            name=name,
-            recursive=extra.get("recursive", True),
-            exclude=extra.get("exclude", []),
+    def test_usage_errors(self):
+        self.assertEqual(run_cli("ip", "analyze")[0], 2)
+        self.assertEqual(run_cli("ip", "analyze", "1.1.1.1", "--timeout", "0")[0], 2)
+        self.assertEqual(run_cli("ip", "analyze", "1.1.1.1", "--limit", "0")[0], 2)
+
+    def test_standard_input_and_json_export(self):
+        target = self.root / "out.json"
+
+        code, _ = run_cli(
+            "ip", "analyze", "--file", "-", "--json", target,
+            input_text="1.1.1.1\n192.168.0.1\n",
         )
-
-    def check(self, name="demo", output=None):
-        return self.run_command(
-            integrity_cli.handle_check,
-            name=name,
-            output=output,
-        )
-
-    def test_create_then_check_without_changes(self):
-        (self.target / "a.txt").write_text("a")
-
-        code, text = self.create()
+        data = json.loads(target.read_text())
 
         self.assertEqual(code, 0)
-        self.assertIn("Files recorded: 1", text)
-        self.assertEqual(self.check()[0], 0)
+        self.assertEqual(data["summary"]["total"], 2)
+        self.assertEqual(data["summary"]["global"], 1)
 
-    def test_check_reports_changes_with_exit_code_1(self):
-        (self.target / "a.txt").write_text("a")
-        self.create()
-        (self.target / "a.txt").write_text("changed")
-        (self.target / "b.txt").write_text("b")
-
+    def test_report_from_the_log_analyzer(self):
         report = self.root / "report.json"
-        code, text = self.check(output=str(report))
+        report.write_text(json.dumps({"findings": [
+            {"rule_id": "brute_force", "severity": "HIGH", "source_ip": "198.51.100.7"},
+        ]}))
 
-        self.assertEqual(code, 1)
-        self.assertIn("[MODIFIED] a.txt", text)
-        self.assertIn("[ADDED] b.txt", text)
-        self.assertEqual(json.loads(report.read_text())["summary"]["added"], 1)
+        code, output = run_cli("ip", "analyze", "--from-report", report)
 
-    def test_update_accepts_the_new_state(self):
-        (self.target / "a.txt").write_text("a")
-        self.create()
-        (self.target / "a.txt").write_text("changed")
-
-        code, _ = self.run_command(integrity_cli.handle_update, name="demo")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(self.check()[0], 0)
-
-    def test_create_refuses_to_replace_a_baseline(self):
-        self.create()
-
-        with self.assertRaises(ValueError):
-            self.create()
-
-    def test_baseline_names_are_validated(self):
-        for name in ("../escape", "a/b", "", "x" * 65, "with space"):
-            with self.subTest(name=name):
-                with self.assertRaises(ValueError):
-                    integrity_cli.baseline_path(name)
-
-    def test_hash_command(self):
-        path = self.target / "abc"
-        path.write_text("abc")
-
-        code, text = self.run_command(
-            integrity_cli.handle_hash,
-            target=str(path),
-        )
-
-        self.assertEqual(code, 0)
-        self.assertIn("ba7816bf8f01cfea", text)
-
-        with self.assertRaises(ValueError):
-            integrity_cli.handle_hash(
-                argparse.Namespace(target=str(self.target))
-            )
+        self.assertEqual(code, 0, output)
+        self.assertIn("max severity: HIGH", output)
 
 
 if __name__ == "__main__":

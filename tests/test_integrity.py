@@ -1,555 +1,316 @@
+import argparse
+import contextlib
 import io
-import os
+import json
 import stat
-import struct
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from src.encryption import keys
-from src.encryption.engine import decrypt_stream, encrypt_stream
-from src.encryption.format import (
-    HEADER_SIZE,
-    KDF_ARGON2ID,
-    KDF_HKDF_SHA256,
-    TAG_SIZE,
-    AuthenticationError,
-    EncryptionError,
-    Header,
-    payload_summary,
+from src.integrity import cli as integrity_cli
+from src.integrity.baseline import (
+    create_baseline_data,
+    load_baseline,
+    save_json,
 )
-from src.encryption.keys import (
-    KeySource,
-    derive_file_key,
-    generate_key_file,
-    load_key_file,
-    load_password_file,
-    prompt_password,
+from src.integrity.checker import compare_integrity
+from src.integrity.hasher import calculate_sha256
+from src.integrity.scanner import is_excluded, scan_target
+from tests.helpers import requires_linux
+
+EMPTY_SHA256 = (
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
-from src.encryption.service import (
-    collect_jobs,
-    decrypt_file,
-    encrypt_file,
-    inspect_file,
-    run_job,
-    Job,
-)
-from tests.helpers import requires_linux, run_cli
-
-CHUNK = 4096
-SECRET = bytes(range(32))
-KEY_SOURCE = KeySource("key-file", SECRET)
-HEADER_STRUCT = struct.Struct(">8sBBBBIIII32s")
 
 
-def make_header(**overrides):
-    values = dict(
-        kdf_id=KDF_HKDF_SHA256,
-        chunk_size=CHUNK,
-        kdf_memory_kib=0,
-        kdf_iterations=0,
-        kdf_lanes=0,
-        salt=b"s" * 32,
-    )
-    values.update(overrides)
-
-    return Header(**values)
-
-
-def encrypt_bytes(data, chunk=CHUNK):
-    header = make_header(chunk_size=chunk)
-    key = derive_file_key(KEY_SOURCE, header)
-    out = io.BytesIO()
-    encrypt_stream(io.BytesIO(data), out, key, header.pack(), chunk)
-
-    return out.getvalue()
-
-
-def decrypt_bytes(blob, chunk=CHUNK):
-    header_bytes = blob[:HEADER_SIZE]
-    header = Header.unpack(header_bytes)
-    key = derive_file_key(KEY_SOURCE, header)
-    reader = io.BytesIO(blob)
-    reader.seek(HEADER_SIZE)
-    out = io.BytesIO()
-    decrypt_stream(reader, out, key, header_bytes, header.chunk_size)
-
-    return out.getvalue()
-
-
-class HeaderTests(unittest.TestCase):
-    def test_round_trip(self):
-        header = make_header(
-            kdf_id=KDF_ARGON2ID,
-            kdf_memory_kib=65536,
-            kdf_iterations=3,
-            kdf_lanes=4,
-        )
-
-        self.assertEqual(Header.unpack(header.pack()), header)
-        self.assertEqual(len(header.pack()), HEADER_SIZE)
-
-    def test_hostile_headers_are_rejected(self):
-        def raw(**fields):
-            values = dict(
-                magic=b"LSTK-ENC", version=1, cipher=1, kdf=1, reserved=0,
-                chunk=1048576, memory=65536, iterations=3, lanes=4,
-                salt=b"s" * 32,
-            )
-            values.update(fields)
-
-            return HEADER_STRUCT.pack(*values.values())
-
-        cases = {
-            "bad signature": raw(magic=b"NOTMAGIC"),
-            "future version": raw(version=9),
-            "unknown cipher": raw(cipher=7),
-            "reserved bits": raw(reserved=1),
-            "unknown kdf": raw(kdf=7),
-            "tiny block size": raw(chunk=10),
-            "huge block size": raw(chunk=2**31),
-            "huge memory": raw(memory=2**32 - 1),
-            "too little memory": raw(memory=8, lanes=4),
-            "huge iterations": raw(iterations=10**6),
-            "zero lanes": raw(lanes=0),
-            "too short": b"LSTK-ENC",
-            "hkdf with parameters": raw(kdf=2, memory=5),
-        }
-
-        for name, data in cases.items():
-            with self.subTest(name):
-                with self.assertRaises(EncryptionError):
-                    Header.unpack(data)
-
-    def test_payload_summary(self):
-        header = make_header()
-
-        self.assertEqual(payload_summary(HEADER_SIZE + TAG_SIZE, header), (1, 0))
-        self.assertEqual(
-            payload_summary(HEADER_SIZE + CHUNK + 2 * TAG_SIZE + 10, header),
-            (2, CHUNK + 10),
-        )
-
-        with self.assertRaises(EncryptionError):
-            payload_summary(HEADER_SIZE + 5, header)
-
-
-class EngineTests(unittest.TestCase):
-    def test_round_trip_around_block_boundaries(self):
-        for size in (0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK, 3 * CHUNK + 17):
-            with self.subTest(size=size):
-                data = os.urandom(size)
-                blob = encrypt_bytes(data)
-                blocks = max(1, -(-size // CHUNK))
-
-                self.assertEqual(len(blob), HEADER_SIZE + size + TAG_SIZE * blocks)
-                self.assertEqual(decrypt_bytes(blob), data)
-
-    def test_plaintext_does_not_appear_in_the_output(self):
-        marker = b"TOP-SECRET-MARKER" * 10
-
-        self.assertNotIn(b"TOP-SECRET-MARKER", encrypt_bytes(marker))
-
-    def test_tampering_is_detected(self):
-        blob = encrypt_bytes(os.urandom(3 * CHUNK + 5))
-        block = CHUNK + TAG_SIZE
-        first = blob[HEADER_SIZE:HEADER_SIZE + block]
-        second = blob[HEADER_SIZE + block:HEADER_SIZE + 2 * block]
-        rest = blob[HEADER_SIZE + 2 * block:]
-
-        def flip(position):
-            data = bytearray(blob)
-            data[position] ^= 1
-            return bytes(data)
-
-        cases = {
-            "salt": flip(40),
-            "first block": flip(HEADER_SIZE + 100),
-            "tag": flip(HEADER_SIZE + block - 1),
-            "last block": flip(len(blob) - 5),
-            "truncated at a block boundary": blob[:HEADER_SIZE + 2 * block],
-            "truncated in the middle": blob[:HEADER_SIZE + block + 500],
-            "extra byte": blob + b"\0",
-            "swapped blocks": blob[:HEADER_SIZE] + second + first + rest,
-            "duplicated block": blob[:HEADER_SIZE] + first + second + second + rest,
-        }
-
-        for name, data in cases.items():
-            with self.subTest(name):
-                with self.assertRaises(EncryptionError):
-                    decrypt_bytes(data)
-
-    def test_wrong_key_is_reported_as_authentication_error(self):
-        blob = encrypt_bytes(b"data")
-        header_bytes = blob[:HEADER_SIZE]
-        header = Header.unpack(header_bytes)
-        wrong = derive_file_key(KeySource("key-file", b"\x01" * 32), header)
-        reader = io.BytesIO(blob)
-        reader.seek(HEADER_SIZE)
-
-        with self.assertRaises(AuthenticationError):
-            decrypt_stream(reader, io.BytesIO(), wrong, header_bytes, CHUNK)
-
-
-class KeyTests(unittest.TestCase):
+class TemporaryDirectoryTestCase(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
-    def test_key_files(self):
-        path = self.root / "k.key"
-
-        generate_key_file(path, force=False)
-
-        self.assertEqual(path.stat().st_size, 32)
-        self.assertEqual(load_key_file(path).method, "key-file")
-
-        with self.assertRaises(EncryptionError):
-            generate_key_file(path, force=False)
-
-        before = path.read_bytes()
-        generate_key_file(path, force=True)
-
-        self.assertNotEqual(path.read_bytes(), before)
-
-    @requires_linux
-    def test_key_files_are_private(self):
-        path = self.root / "k.key"
-
-        generate_key_file(path, force=False)
-
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-
-    def test_wrong_size_key_file(self):
-        path = self.root / "short.key"
-        path.write_bytes(b"x" * 31)
-
-        with self.assertRaises(EncryptionError):
-            load_key_file(path)
-
-        with self.assertRaises(EncryptionError):
-            load_key_file(self.root / "missing.key")
-
-    def test_password_file_handling(self):
-        cases = {
-            "secret-password\n": b"secret-password",
-            "secret-password\r\n": b"secret-password",
-            "secret-password": b"secret-password",
-            "with spaces inside\n": b"with spaces inside",
-        }
-
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                path = self.root / "p.txt"
-                path.write_bytes(text.encode())
-
-                self.assertEqual(load_password_file(path, True).secret, expected)
-
-    def test_password_file_errors(self):
-        path = self.root / "p.txt"
-
-        for content, strict in ((b"", True), (b"short", True), (b"\xff\xfe", False)):
-            with self.subTest(content=content):
-                path.write_bytes(content)
-
-                with self.assertRaises(EncryptionError):
-                    load_password_file(path, strict)
-
-        path.write_bytes(b"short")
-
-        self.assertEqual(load_password_file(path, False).secret, b"short")
-
-    def test_passwords_are_normalized(self):
-        self.assertEqual(
-            keys.normalize_password("e\u0301"),
-            keys.normalize_password("\u00e9"),
-        )
-
-    def test_prompt_needs_a_terminal(self):
-        with mock.patch("sys.stdin") as stdin:
-            stdin.isatty.return_value = False
-
-            with self.assertRaises(EncryptionError):
-                prompt_password(confirm=True)
-
-    def test_prompt_confirmation(self):
-        with mock.patch("sys.stdin") as stdin, \
-                mock.patch("getpass.getpass", side_effect=["long-password", "long-password"]):
-            stdin.isatty.return_value = True
-
-            self.assertEqual(prompt_password(confirm=True).secret, b"long-password")
-
-        with mock.patch("sys.stdin") as stdin, \
-                mock.patch("getpass.getpass", side_effect=["long-password", "another-one"]):
-            stdin.isatty.return_value = True
-
-            with self.assertRaises(EncryptionError):
-                prompt_password(confirm=True)
-
-        with mock.patch("sys.stdin") as stdin, \
-                mock.patch("getpass.getpass", return_value="abc"):
-            stdin.isatty.return_value = True
-
-            with self.assertRaises(EncryptionError):
-                prompt_password(confirm=True)
-
-    def test_each_file_gets_a_different_key(self):
-        first = derive_file_key(KEY_SOURCE, make_header(salt=b"a" * 32))
-        second = derive_file_key(KEY_SOURCE, make_header(salt=b"b" * 32))
-
-        self.assertNotEqual(first, second)
-
-    def test_using_the_wrong_method_gives_a_clear_message(self):
-        password = KeySource("password", b"long-password")
-
-        with self.assertRaises(EncryptionError) as context:
-            derive_file_key(password, make_header())
-
-        self.assertIn("key file", str(context.exception))
-
-        argon = make_header(
-            kdf_id=KDF_ARGON2ID, kdf_memory_kib=65536, kdf_iterations=3, kdf_lanes=4,
-        )
-
-        with self.assertRaises(EncryptionError) as context:
-            derive_file_key(KEY_SOURCE, argon)
-
-        self.assertIn("password", str(context.exception))
-
-
-class ServiceTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        self.password = KeySource("password", b"correct horse battery")
-
-    def write(self, name, data=b"hello"):
-        path = self.root / name
+    def write(self, relative, content="data"):
+        path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        path.write_text(content)
         return path
 
-    def leftovers(self):
-        return [p.name for p in self.root.rglob(".lstk-*")]
 
-    def test_password_round_trip(self):
-        source = self.write("notes.txt", os.urandom(300_000))
-        original = source.read_bytes()
-        encrypted = self.root / "notes.txt.enc"
+class HasherTests(TemporaryDirectoryTestCase):
+    def test_known_digests(self):
+        empty = self.write("empty", "")
+        abc = self.write("abc", "abc")
 
-        encrypt_file(source, encrypted, self.password, force=False)
-        source.unlink()
-        decrypt_file(encrypted, source, self.password, force=False)
-
-        self.assertEqual(source.read_bytes(), original)
-        self.assertEqual(self.leftovers(), [])
-
-    @requires_linux
-    def test_outputs_are_private(self):
-        source = self.write("a.txt")
-        target = self.root / "a.txt.enc"
-
-        encrypt_file(source, target, KEY_SOURCE, force=False)
-
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
-
-    def test_wrong_password_leaves_no_output(self):
-        source = self.write("a.txt")
-        encrypted = self.root / "a.txt.enc"
-        encrypt_file(source, encrypted, self.password, force=False)
-        source.unlink()
-
-        with self.assertRaises(AuthenticationError):
-            decrypt_file(encrypted, source, KeySource("password", b"another password"), force=False)
-
-        self.assertFalse(source.exists())
-        self.assertEqual(self.leftovers(), [])
-
-    def test_existing_output_is_protected(self):
-        source = self.write("a.txt")
-        target = self.write("a.txt.enc", b"precious")
-
-        with self.assertRaises(EncryptionError):
-            encrypt_file(source, target, KEY_SOURCE, force=False)
-
-        self.assertEqual(target.read_bytes(), b"precious")
-
-        encrypt_file(source, target, KEY_SOURCE, force=True)
-
-        self.assertNotEqual(target.read_bytes(), b"precious")
-
-    def test_output_cannot_be_the_input(self):
-        source = self.write("a.txt")
-
-        with self.assertRaises(EncryptionError):
-            encrypt_file(source, source, KEY_SOURCE, force=True)
-
-        self.assertEqual(source.read_bytes(), b"hello")
-
-    @requires_linux
-    def test_symbolic_links_are_refused(self):
-        source = self.write("a.txt")
-        link = self.root / "link.txt"
-        link.symlink_to(source)
-        victim = self.write("victim.enc", b"keep")
-        (self.root / "a.txt.enc").symlink_to(victim)
-
-        with self.assertRaises(EncryptionError):
-            encrypt_file(link, self.root / "x.enc", KEY_SOURCE, force=False)
-
-        with self.assertRaises(EncryptionError):
-            encrypt_file(source, self.root / "a.txt.enc", KEY_SOURCE, force=True)
-
-        self.assertEqual(victim.read_bytes(), b"keep")
-
-    def test_same_input_gives_different_ciphertexts(self):
-        source = self.write("a.txt")
-
-        encrypt_file(source, self.root / "1.enc", KEY_SOURCE, force=False)
-        encrypt_file(source, self.root / "2.enc", KEY_SOURCE, force=False)
-
-        self.assertNotEqual(
-            (self.root / "1.enc").read_bytes()[HEADER_SIZE:],
-            (self.root / "2.enc").read_bytes()[HEADER_SIZE:],
+        self.assertEqual(calculate_sha256(empty), EMPTY_SHA256)
+        self.assertEqual(
+            calculate_sha256(abc),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         )
 
-    def test_inspect_does_not_need_the_key(self):
-        source = self.write("a.txt", b"x" * 5000)
-        encrypted = self.root / "a.txt.enc"
-        encrypt_file(source, encrypted, self.password, force=False)
+    def test_large_files_are_read_in_chunks(self):
+        path = self.root / "big"
+        path.write_bytes(b"x" * (3 * 1024 * 1024 + 5))
 
-        info = inspect_file(encrypted)
+        self.assertEqual(len(calculate_sha256(path)), 64)
 
-        self.assertEqual(info.plaintext_size, 5000)
-        self.assertEqual(info.header.kdf_id, KDF_ARGON2ID)
 
-        with self.assertRaises(EncryptionError):
-            inspect_file(source)
+class ScannerTests(TemporaryDirectoryTestCase):
+    def test_exclusion_patterns(self):
+        self.assertTrue(is_excluded("a/b/file.log", ["*.log"]))
+        self.assertTrue(is_excluded("a/cache/x", ["cache"]))
+        self.assertFalse(is_excluded("a/b/file.txt", ["*.log"]))
 
-    def test_job_planning(self):
+    def test_non_recursive_scan_ignores_subdirectories(self):
+        self.write("top.txt")
+        self.write("sub/inner.txt")
+
+        result = scan_target(self.root)
+
+        self.assertEqual(set(result.files), {"top.txt"})
+        self.assertEqual(result.errors, {})
+
+    def test_recursive_scan_with_exclusions(self):
+        self.write("top.txt")
+        self.write("sub/inner.txt")
+        self.write("sub/skip.log")
+        self.write("cache/data.txt")
+
+        result = scan_target(
+            self.root,
+            recursive=True,
+            exclusions=["*.log", "cache"],
+        )
+
+        self.assertEqual(set(result.files), {"top.txt", "sub/inner.txt"})
+
+    def test_records_hash_size_and_permissions(self):
+        path = self.write("file.txt", "abc")
+        path.chmod(0o640)
+
+        record = scan_target(self.root).files["file.txt"]
+
+        self.assertEqual(record["size"], 3)
+        self.assertEqual(
+            record["permissions"],
+            stat.filemode(path.stat().st_mode),
+        )
+        self.assertEqual(len(record["sha256"]), 64)
+
+    def test_single_file_target(self):
+        path = self.write("one.txt")
+
+        result = scan_target(path)
+
+        self.assertEqual(set(result.files), {"one.txt"})
+
+    def test_rejects_invalid_targets(self):
+        with self.assertRaises(ValueError):
+            scan_target(self.root / "missing")
+
+    @requires_linux
+    def test_symbolic_links_are_never_followed(self):
+        target = self.write("real.txt")
+        (self.root / "link.txt").symlink_to(target)
+        (self.root / "linkdir").symlink_to(self.root, target_is_directory=True)
+
+        result = scan_target(self.root, recursive=True)
+
+        self.assertEqual(set(result.files), {"real.txt"})
+        self.assertIn("link.txt", result.errors)
+
+        with self.assertRaises(ValueError):
+            scan_target(self.root / "link.txt")
+
+
+class CheckerTests(TemporaryDirectoryTestCase):
+    def test_detects_every_kind_of_change(self):
+        for name in ("same", "changed", "removed", "perm"):
+            self.write(name, name)
+
+        baseline = scan_target(self.root).files
+
+        self.write("changed", "different content")
+        (self.root / "removed").unlink()
+        (self.root / "perm").chmod(0o600)
+        self.write("new", "new")
+
+        report = compare_integrity(baseline, scan_target(self.root))
+
+        self.assertEqual(report.unchanged, ["same"])
+        self.assertEqual(report.modified, ["changed", "perm"])
+        self.assertEqual(report.added, ["new"])
+        self.assertEqual(report.deleted, ["removed"])
+        self.assertEqual(report.to_dict()["summary"]["modified"], 2)
+
+    def test_files_with_errors_are_not_reported_as_deleted(self):
         self.write("a.txt")
-        self.write("sub/b.txt")
-        self.write("sub/c.txt.enc")
-        self.write("top.key", b"k" * 32)
+        baseline = scan_target(self.root).files
+        current = scan_target(self.root)
+        current.files.clear()
+        current.errors["a.txt"] = "Permission denied"
 
-        encrypt = collect_jobs([self.root], "encrypt", True, None, frozenset({(self.root / "top.key").resolve()}))
-        decrypt = collect_jobs([self.root], "decrypt", True, None)
+        report = compare_integrity(baseline, current)
 
+        self.assertEqual(report.deleted, [])
+        self.assertEqual(report.errors, {"a.txt": "Permission denied"})
+
+    def test_everything_under_an_unreadable_directory_is_not_deleted(self):
+        self.write("locked/a.txt")
+        baseline = scan_target(self.root, recursive=True).files
+        current = scan_target(self.root, recursive=True)
+        current.files.clear()
+        current.errors["locked"] = "Permission denied"
+
+        self.assertEqual(compare_integrity(baseline, current).deleted, [])
+
+
+class BaselineFileTests(TemporaryDirectoryTestCase):
+    def valid(self):
+        return create_baseline_data(self.root, True, ["*.log"], {})
+
+    def test_round_trip(self):
+        path = self.root / "out" / "baseline.json"
+
+        save_json(path, self.valid())
+        loaded = load_baseline(path)
+
+        self.assertEqual(loaded["recursive"], True)
+        self.assertEqual(loaded["exclusions"], ["*.log"])
+        self.assertEqual(loaded["target"], str(self.root.absolute()))
+
+    @requires_linux
+    def test_file_is_private_and_no_temporary_files_remain(self):
+        path = self.root / "baseline.json"
+
+        save_json(path, self.valid())
+
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(
-            sorted(job.source.name for job in encrypt),
-            ["a.txt", "b.txt"],
-        )
-        self.assertEqual([job.source.name for job in decrypt], ["c.txt.enc"])
-        self.assertEqual(decrypt[0].target.name, "c.txt")
-
-    def test_job_planning_errors(self):
-        file = self.write("plain.bin")
-
-        jobs = collect_jobs([self.root, self.root / "missing", file], "decrypt", False, None)
-
-        self.assertEqual(
-            [job.error for job in jobs],
-            [
-                "It is a directory (use --recursive).",
-                "File not found.",
-                "Cannot determine the output name; use --output.",
-            ],
+            [item.name for item in self.root.iterdir()],
+            ["baseline.json"],
         )
 
-        with self.assertRaises(EncryptionError):
-            collect_jobs([file, file], "encrypt", False, self.root / "o")
+    def test_rejects_invalid_content(self):
+        valid = self.valid()
+        broken = {
+            "not an object": [],
+            "wrong version": {**valid, "version": 99},
+            "files not an object": {**valid, "files": []},
+            "target missing": {**valid, "target": None},
+            "recursive not boolean": {**valid, "recursive": "yes"},
+            "bad exclusions": {**valid, "exclusions": [1]},
+        }
 
-        excluded = collect_jobs([file], "encrypt", False, None, frozenset({file.resolve()}))
+        for name, data in broken.items():
+            with self.subTest(name):
+                path = self.root / "bad.json"
+                path.write_text(json.dumps(data))
 
-        self.assertIn("key or password file", excluded[0].error)
-
-    def test_failures_are_reported_per_file(self):
-        result = run_job("encrypt", Job(self.root / "missing", self.root / "x.enc"), KEY_SOURCE, False)
-
-        self.assertFalse(result.success)
+                with self.assertRaises(ValueError):
+                    load_baseline(path)
 
 
-class CommandLineTests(unittest.TestCase):
+class CommandTests(TemporaryDirectoryTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-        self.password = self.root / "password.txt"
-        self.password.write_text("correct horse battery staple\n")
+        super().setUp()
+        self.data = self.root / "data"
+        self.target = self.root / "target"
+        self.target.mkdir()
 
-    def test_full_workflow_with_a_password(self):
-        document = self.root / "doc.txt"
-        document.write_text("contenido secreto\n")
+        patcher = mock.patch.object(integrity_cli, "DATA_DIR", self.data)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-        code, output = run_cli("encryption", "encrypt", document, "--password-file", self.password)
-        self.assertEqual(code, 0, output)
-        self.assertIn("Succeeded: 1", output)
+    def run_command(self, handler, **kwargs):
+        output = io.StringIO()
+        code = 0
 
-        code, output = run_cli("encryption", "info", self.root / "doc.txt.enc")
-        self.assertIn("Argon2id (password)", output)
+        with contextlib.redirect_stdout(output):
+            try:
+                handler(argparse.Namespace(**kwargs))
+            except SystemExit as error:
+                code = error.code
 
-        document.unlink()
-        code, output = run_cli("encryption", "decrypt", self.root / "doc.txt.enc", "--password-file", self.password)
+        return code, output.getvalue()
 
-        self.assertEqual(code, 0, output)
-        self.assertEqual(document.read_text(), "contenido secreto\n")
+    def create(self, name="demo", **extra):
+        return self.run_command(
+            integrity_cli.handle_create,
+            target=str(self.target),
+            name=name,
+            recursive=extra.get("recursive", True),
+            exclude=extra.get("exclude", []),
+        )
 
-    def test_workflow_with_a_key_file_and_wrong_credentials(self):
-        key = self.root / "k.key"
-        document = self.root / "doc.txt"
-        document.write_text("data")
+    def check(self, name="demo", output=None):
+        return self.run_command(
+            integrity_cli.handle_check,
+            name=name,
+            output=output,
+        )
 
-        self.assertEqual(run_cli("encryption", "keygen", key)[0], 0)
-        self.assertEqual(run_cli("encryption", "keygen", key)[0], 2)
-        self.assertEqual(run_cli("encryption", "encrypt", document, "--key-file", key)[0], 0)
-        document.unlink()
+    def test_create_then_check_without_changes(self):
+        (self.target / "a.txt").write_text("a")
 
-        code, output = run_cli("encryption", "decrypt", self.root / "doc.txt.enc", "--password-file", self.password)
-
-        self.assertEqual(code, 2)
-        self.assertIn("key file", output)
-        self.assertFalse(document.exists())
-
-        code, _ = run_cli("encryption", "decrypt", self.root / "doc.txt.enc", "--key-file", key)
+        code, text = self.create()
 
         self.assertEqual(code, 0)
-        self.assertEqual(document.read_text(), "data")
+        self.assertIn("Files recorded: 1", text)
+        self.assertEqual(self.check()[0], 0)
 
-    def test_recursive_run_never_encrypts_its_own_key(self):
-        vault = self.root / "vault"
-        vault.mkdir()
-        (vault / "doc.txt").write_text("x")
-        key = vault / "k.key"
-        run_cli("encryption", "keygen", key)
+    def test_check_reports_changes_with_exit_code_1(self):
+        (self.target / "a.txt").write_text("a")
+        self.create()
+        (self.target / "a.txt").write_text("changed")
+        (self.target / "b.txt").write_text("b")
 
-        code, output = run_cli("encryption", "encrypt", vault, "--recursive", "--key-file", key)
+        report = self.root / "report.json"
+        code, text = self.check(output=str(report))
 
-        self.assertEqual(code, 0, output)
-        self.assertTrue((vault / "doc.txt.enc").exists())
-        self.assertFalse((vault / "k.key.enc").exists())
+        self.assertEqual(code, 1)
+        self.assertIn("[MODIFIED] a.txt", text)
+        self.assertIn("[ADDED] b.txt", text)
+        self.assertEqual(json.loads(report.read_text())["summary"]["added"], 1)
 
-    def test_without_a_terminal_a_password_cannot_be_requested(self):
-        document = self.root / "doc.txt"
-        document.write_text("x")
+    def test_update_accepts_the_new_state(self):
+        (self.target / "a.txt").write_text("a")
+        self.create()
+        (self.target / "a.txt").write_text("changed")
 
-        code, output = run_cli("encryption", "encrypt", document, input_text="")
+        code, _ = self.run_command(integrity_cli.handle_update, name="demo")
 
-        self.assertEqual(code, 2)
-        self.assertIn("terminal", output)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.check()[0], 0)
 
-    def test_conflicting_key_options(self):
-        document = self.root / "doc.txt"
-        document.write_text("x")
+    def test_create_refuses_to_replace_a_baseline(self):
+        self.create()
 
-        code, _ = run_cli(
-            "encryption", "encrypt", document,
-            "--key-file", self.root / "k", "--password-file", self.password,
+        with self.assertRaises(ValueError):
+            self.create()
+
+    def test_baseline_names_are_validated(self):
+        for name in ("../escape", "a/b", "", "x" * 65, "with space"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    integrity_cli.baseline_path(name)
+
+    def test_hash_command(self):
+        path = self.target / "abc"
+        path.write_text("abc")
+
+        code, text = self.run_command(
+            integrity_cli.handle_hash,
+            target=str(path),
         )
 
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 0)
+        self.assertIn("ba7816bf8f01cfea", text)
+
+        with self.assertRaises(ValueError):
+            integrity_cli.handle_hash(
+                argparse.Namespace(target=str(self.target))
+            )
 
 
 if __name__ == "__main__":

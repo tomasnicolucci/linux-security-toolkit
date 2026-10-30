@@ -1,443 +1,574 @@
-import http.server
+import gzip
 import json
-import socketserver
+import random
 import tempfile
-import threading
-import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest import mock
+from zoneinfo import ZoneInfo
 
-from src.ip import lookup
-from src.ip.analyzer import analyze_address, analyze_addresses
-from src.ip.classifier import canonical_address, classify, parse_address
-from src.ip.lookup import RdapError, lookup_rdap, parse_rdap, reverse_dns
-from src.ip.models import AddressEntry
-from src.ip.sources import (
-    build_entries,
-    read_address_file,
-    read_report_entries,
+from src.logs.config import AVAILABLE_RULES, load_config
+from src.logs.correlation import (
+    deduplicate_ssh_failures,
+    find_event_windows,
+    find_success_after_failures,
 )
-from src.ip.text import clean_text
-from tests.helpers import run_cli
+from src.logs.filters import create_filters, filter_events
+from src.logs.ip_history import (
+    approve_ips,
+    load_known_ips,
+    revoke_ips,
+    save_known_ips,
+)
+from src.logs.models import EventType, SecurityEvent
+from src.logs.parser import parse_log_line
+from src.logs.reader import discover_log_files, read_log_lines, LogLine
+from tests.helpers import requires_linux, run_cli
+from tests.logs_support import LogTestCase, failed_login, syslog
+
+BUENOS_AIRES = ZoneInfo("America/Argentina/Buenos_Aires")
 
 
-class ClassifierTests(unittest.TestCase):
-    def test_categories(self):
-        expected = {
-            "8.8.8.8": ("global", True),
-            "10.1.2.3": ("private", False),
-            "172.16.0.1": ("private", False),
-            "192.168.1.1": ("private", False),
-            "127.0.0.1": ("loopback", False),
-            "169.254.1.1": ("link_local", False),
-            "100.64.0.5": ("carrier_grade_nat", False),
-            "203.0.113.25": ("documentation", False),
-            "198.18.0.1": ("benchmarking", False),
-            "224.0.0.1": ("multicast", False),
-            "0.0.0.0": ("unspecified", False),
-            "255.255.255.255": ("broadcast", False),
-            "240.0.0.1": ("reserved", False),
-            "::1": ("loopback", False),
-            "fe80::1": ("link_local", False),
-            "fc00::1": ("private", False),
-            "2001:db8::1": ("documentation", False),
-            "ff02::1": ("multicast", False),
-            "2606:4700:4700::1111": ("global", True),
+def parse(content, **kwargs):
+    return parse_log_line(LogLine("test.log", 1, content), **kwargs)
+
+
+def event(seconds, ip="1.1.1.1", user="root", kind=EventType.SSH_LOGIN_FAILED,
+          pid=None):
+    base = datetime(2026, 10, 14, tzinfo=timezone.utc)
+
+    return SecurityEvent(
+        timestamp=base + timedelta(seconds=seconds),
+        event_type=kind,
+        source="t.log",
+        line_number=seconds,
+        service="sshd",
+        message="x",
+        source_ip=ip,
+        username=user,
+        process_id=pid,
+    )
+
+
+class ParserTests(unittest.TestCase):
+    def test_ssh_events(self):
+        failed = parse(
+            "Oct 14 03:00:00 srv sshd[10]: Failed password for root "
+            "from 198.51.100.7 port 22 ssh2",
+            year=2026,
+        )
+        invalid = parse(
+            "Oct 14 03:00:00 srv sshd[10]: Invalid user zed "
+            "from 198.51.100.7 port 22",
+            year=2026,
+        )
+        accepted = parse(
+            "Oct 14 03:00:00 srv sshd[10]: Accepted publickey for alice "
+            "from 2001:db8::1 port 22 ssh2",
+            year=2026,
+        )
+
+        self.assertEqual(failed.event_type, EventType.SSH_LOGIN_FAILED)
+        self.assertEqual((failed.username, failed.source_ip), ("root", "198.51.100.7"))
+        self.assertEqual(failed.process_id, 10)
+        self.assertEqual(invalid.event_type, EventType.SSH_INVALID_USER)
+        self.assertEqual(invalid.username, "zed")
+        self.assertEqual(accepted.event_type, EventType.SSH_LOGIN_SUCCESS)
+        self.assertEqual(accepted.source_ip, "2001:db8::1")
+
+    def test_failure_for_invalid_user_keeps_the_user_name(self):
+        item = parse(
+            "Oct 14 03:00:00 srv sshd[10]: Failed password for invalid "
+            "user guest from 198.51.100.7 port 22 ssh2",
+            year=2026,
+        )
+
+        self.assertEqual(item.username, "guest")
+
+    def test_privilege_and_account_events(self):
+        cases = {
+            "sudo[1]: alice : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/bin/ls":
+                EventType.SUDO_COMMAND,
+            "sudo[1]: alice : 3 incorrect password attempts ; COMMAND=/bin/ls":
+                EventType.SUDO_AUTH_FAILED,
+            "su[1]: Successful su for root by alice": EventType.SU_SUCCESS,
+            "su[1]: FAILED SU (to root) alice on pts/0": EventType.SU_FAILED,
+            "useradd[1]: new user: name=bob, UID=1001, GID=1001":
+                EventType.USER_CREATED,
+            "userdel[1]: delete user 'bob'": EventType.USER_DELETED,
+            "passwd[1]: password changed for alice":
+                EventType.PASSWORD_CHANGED,
+            "groupadd[1]: new group: name=ops, GID=1100":
+                EventType.GROUP_CREATED,
+            "nginx[1]: connect() failed: error": EventType.SERVICE_ERROR,
+            "cron[1]: job started": EventType.UNKNOWN,
         }
 
-        for address, (category, is_global) in expected.items():
-            with self.subTest(address=address):
-                result = classify(address)
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                item = parse(f"Oct 14 10:00:00 srv {message}", year=2026)
+                self.assertEqual(item.event_type, expected)
 
-                self.assertEqual(result.category, category)
-                self.assertEqual(result.is_global, is_global)
+    def test_refused_sudo_attempts_are_failures_even_with_a_command(self):
+        # Real sudo logs the refused command too ("COMMAND=...").
+        cases = {
+            "alice : 3 incorrect password attempts ; TTY=pts/0 ; "
+            "PWD=/ ; USER=root ; COMMAND=/bin/ls": "alice",
+            "alice : user NOT in sudoers ; TTY=pts/0 ; PWD=/ ; "
+            "USER=root ; COMMAND=/bin/ls": "alice",
+            "pam_unix(sudo:auth): authentication failure; logname=bob "
+            "uid=1000 euid=0 tty=/dev/pts/0 ruser=bob rhost=  user=bob": "bob",
+        }
 
-    def test_versions_and_reverse_pointer(self):
-        self.assertEqual(classify("1.2.3.4").version, 4)
-        self.assertEqual(classify("1.2.3.4").reverse_pointer, "4.3.2.1.in-addr.arpa")
-        self.assertEqual(classify("2001:db8::1").version, 6)
+        for message, user in cases.items():
+            with self.subTest(message=message):
+                item = parse(f"Oct 14 10:00:00 srv sudo[1]: {message}", year=2026)
 
-    def test_ipv4_mapped_addresses_are_unwrapped(self):
-        result = classify("::ffff:8.8.4.4")
+                self.assertEqual(item.event_type, EventType.SUDO_AUTH_FAILED)
+                self.assertEqual(item.username, user)
 
-        self.assertEqual(result.address, "8.8.4.4")
-        self.assertEqual(result.version, 4)
-        self.assertTrue(result.is_global)
-        self.assertTrue(result.notes)
-
-    def test_scope_identifier_is_ignored(self):
-        self.assertEqual(classify("fe80::1%eth0").category, "link_local")
-
-    def test_invalid_addresses(self):
-        for value in ("999.1.1.1", "abc", "", "  ", "1.2.3", "1.2.3.4/24"):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    classify(value)
-
-    def test_canonical_form_is_used_to_find_duplicates(self):
-        self.assertEqual(canonical_address("::ffff:1.2.3.4"), "1.2.3.4")
-        self.assertEqual(canonical_address("2001:0db8:0:0:0:0:0:1"), "2001:db8::1")
-        self.assertIsNone(canonical_address("nope"))
-        self.assertEqual(str(parse_address(" 10.0.0.1 ")), "10.0.0.1")
-
-
-class TextTests(unittest.TestCase):
-    def test_control_characters_are_removed(self):
-        self.assertEqual(clean_text("a\x1b[31mred\x00\n b"), "a [31mred b")
-
-    def test_limits_and_types(self):
-        self.assertEqual(len(clean_text("x" * 500)), 200)
-        self.assertIsNone(clean_text(5))
-        self.assertIsNone(clean_text("   \t"))
-
-
-class SourceTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
-
-    def test_address_file_ignores_comments_and_blank_lines(self):
-        path = self.root / "ips.txt"
-        path.write_text("# header\n8.8.8.8   # google\n\n10.0.0.5\n")
-
-        self.assertEqual(read_address_file(str(path)), ["8.8.8.8", "10.0.0.5"])
-
-    def test_address_file_errors(self):
-        with self.assertRaises(ValueError):
-            read_address_file(str(self.root / "missing.txt"))
-
-    def test_standard_input(self):
-        with mock.patch("src.ip.sources.sys.stdin") as stdin:
-            stdin.read.return_value = "1.1.1.1\n2.2.2.2\n"
-
-            self.assertEqual(read_address_file("-"), ["1.1.1.1", "2.2.2.2"])
-
-    def report(self, findings):
-        path = self.root / "report.json"
-        path.write_text(json.dumps({"findings": findings}))
-        return path
-
-    def test_report_entries_are_ordered_by_severity(self):
-        entries = read_report_entries(self.report([
-            {"rule_id": "brute_force", "severity": "MEDIUM", "source_ip": "198.51.100.7"},
-            {"rule_id": "spraying", "severity": "MEDIUM", "source_ip": "198.51.100.7"},
-            {"rule_id": "new_source_ip", "severity": "LOW", "source_ip": "10.0.0.5"},
-            {
-                "rule_id": "distributed_attack",
-                "severity": "HIGH",
-                "source_ip": None,
-                "metadata": {"source_ips": ["192.0.2.1", "192.0.2.2"]},
-            },
-        ]))
-
-        self.assertEqual(
-            [entry.raw for entry in entries],
-            ["192.0.2.1", "192.0.2.2", "198.51.100.7", "10.0.0.5"],
-        )
-        top = entries[2].context
-
-        self.assertEqual((top.findings, top.max_severity), (2, "MEDIUM"))
-        self.assertEqual(top.rules, ("brute_force", "spraying"))
-
-    def test_invalid_reports(self):
-        path = self.root / "bad.json"
-        path.write_text(json.dumps({"events": []}))
-
-        with self.assertRaises(ValueError):
-            read_report_entries(path)
-
-        with self.assertRaises(ValueError):
-            read_report_entries(self.root / "missing.json")
-
-    def test_entries_are_merged_and_limited(self):
-        report = [AddressEntry("1.1.1.1", ["report"])]
-
-        entries, warnings = build_entries(
-            ["1.1.1.1", "::ffff:2.2.2.2"],
-            ["2.2.2.2", "3.3.3.3"],
-            report,
-            limit=3,
+    def test_a_command_that_mentions_failure_words_is_still_a_command(self):
+        item = parse(
+            "Oct 14 10:00:00 srv sudo[1]: alice : TTY=pts/0 ; USER=root ; "
+            "COMMAND=/bin/echo incorrect password",
+            year=2026,
         )
 
-        self.assertEqual([entry.raw for entry in entries], ["1.1.1.1", "::ffff:2.2.2.2", "3.3.3.3"])
-        self.assertEqual(entries[0].sources, ["argument", "report"])
-        self.assertEqual(warnings, [])
+        self.assertEqual(item.event_type, EventType.SUDO_COMMAND)
 
-        _, warnings = build_entries(["1.1.1.1", "2.2.2.2", "3.3.3.3"], [], [], limit=2)
+    def test_sudo_command_is_recorded(self):
+        item = parse(
+            "Oct 14 10:00:00 srv sudo[1]: alice : TTY=pts/0 ; "
+            "USER=root ; COMMAND=/bin/ls -l",
+            year=2026,
+        )
 
-        self.assertIn("1 additional", warnings[0])
+        self.assertEqual(item.username, "alice")
+        self.assertEqual(item.metadata["command"], "/bin/ls -l")
 
+    def test_lines_that_are_not_logs_are_ignored(self):
+        self.assertIsNone(parse("this is not a log line"))
+        self.assertIsNone(parse("   "))
 
-ARIN_RESPONSE = {
-    "name": "GOGL",
-    "handle": "NET-8-8-8-0-2",
-    "startAddress": "8.8.8.0",
-    "endAddress": "8.8.8.255",
-    "cidr0_cidrs": [{"v4prefix": "8.8.8.0", "length": 24}],
-    "entities": [{
-        "roles": ["registrant"],
-        "vcardArray": ["vcard", [["fn", {}, "text", "Google LLC"]]],
-        "entities": [{
-            "roles": ["abuse"],
-            "vcardArray": ["vcard", [["email", {}, "text", "network-abuse@google.com"]]],
-        }],
-    }],
-}
+    def test_month_names(self):
+        self.assertEqual(parse("Ene 19 12:00:00 srv sshd[1]: x", year=2026).timestamp.month, 1)
 
-RIPE_RESPONSE = {
-    "name": "EXAMPLE\x1b[31m-NET",
-    "startAddress": "193.0.0.0",
-    "endAddress": "193.0.7.255",
-    "country": "NL",
-    "entities": [{
-        "roles": ["abuse"],
-        "vcardArray": ["vcard", [["email", {}, "text", "abuse@example.net"]]],
-    }],
-}
+        with self.assertRaises(ValueError):
+            parse("Foo 19 12:00:00 srv sshd[1]: x", year=2026)
 
+        with self.assertRaises(ValueError):
+            parse("Oct 32 12:00:00 srv sshd[1]: x", year=2026)
 
-class RdapParsingTests(unittest.TestCase):
-    def test_nested_entities_and_cidr(self):
-        info = parse_rdap(ARIN_RESPONSE)
+    def test_timestamps_use_the_configured_zone(self):
+        expected = datetime(2026, 10, 19, 15, 0, tzinfo=timezone.utc)
 
-        self.assertEqual(info.network_name, "GOGL")
-        self.assertEqual(info.cidrs, ("8.8.8.0/24",))
-        self.assertEqual(info.ip_range, "8.8.8.0 - 8.8.8.255")
-        self.assertEqual(info.organization, "Google LLC")
-        self.assertEqual(info.abuse_contact, "network-abuse@google.com")
+        syslog_item = parse("Oct 19 12:00:00 srv sshd[1]: x", year=2026, tz=BUENOS_AIRES)
+        naive_iso = parse("2026-10-19T12:00:00 srv sshd[1]: x", tz=BUENOS_AIRES)
+        offset_iso = parse("2026-10-19T12:00:00-03:00 srv sshd[1]: x", tz=BUENOS_AIRES)
 
-    def test_cidr_is_computed_from_the_range_and_text_is_sanitized(self):
-        info = parse_rdap(RIPE_RESPONSE)
+        self.assertEqual(syslog_item.timestamp, expected)
+        self.assertEqual(naive_iso.timestamp, expected)
+        self.assertEqual(offset_iso.timestamp, expected)
 
-        self.assertEqual(info.country, "NL")
-        self.assertEqual(info.cidrs[0], "193.0.0.0/21")
-        self.assertNotIn("\x1b", info.network_name)
-
-    def test_unusable_or_hostile_data(self):
-        for data in (
-            {},
-            {"name": 5},
-            {"entities": "x", "cidr0_cidrs": [1, {"v4prefix": "x"}]},
-        ):
-            with self.subTest(data=data):
-                with self.assertRaises(RdapError):
-                    parse_rdap(data)
-
-        info = parse_rdap({
-            "name": "ok",
-            "startAddress": "1.1.1.1",
-            "endAddress": "garbage",
-            "entities": [None, {"roles": None}, {"roles": ["abuse"], "vcardArray": "x"}],
+    def test_journal_json_lines(self):
+        line = json.dumps({
+            "MESSAGE": "Failed password for root from 203.0.113.2 port 1 ssh2",
+            "__REALTIME_TIMESTAMP": "1792400000000000",
+            "SYSLOG_IDENTIFIER": "sshd",
+            "_PID": "9",
+            "_HOSTNAME": "srv",
         })
 
-        self.assertEqual(info.network_name, "ok")
-        self.assertIsNone(info.abuse_contact)
+        item = parse(line)
 
-    def test_lookup_uses_the_expected_url(self):
-        calls = []
-
-        def fetch(url, timeout):
-            calls.append((url, timeout))
-            return ARIN_RESPONSE
-
-        info = lookup_rdap("8.8.8.8", 4, fetch=fetch)
-
-        self.assertEqual(calls, [("https://rdap.org/ip/8.8.8.8", 4)])
-        self.assertEqual(info.handle, "NET-8-8-8-0-2")
+        self.assertEqual(item.event_type, EventType.SSH_LOGIN_FAILED)
+        self.assertEqual(item.process_id, 9)
+        self.assertEqual(item.timestamp.tzinfo, timezone.utc)
 
 
-class ReverseDnsTests(unittest.TestCase):
-    def test_hostname_is_returned_and_sanitized(self):
-        with mock.patch("socket.gethostbyaddr", return_value=("host\x1b[2J.example.com", [], [])):
-            hostname, message = reverse_dns("1.2.3.4", 2)
+class CorrelationTests(unittest.TestCase):
+    @staticmethod
+    def reference(events, minutes, threshold, key=None):
+        """Straightforward (slow) implementation used as a reference."""
+        ordered = sorted(events, key=lambda e: (e.timestamp, e.source, e.line_number))
+        duration = timedelta(minutes=minutes)
+        matches, left, start, end = [], 0, None, None
 
-        self.assertEqual(hostname, "host [2J.example.com")
-        self.assertIsNone(message)
+        for right, current in enumerate(ordered):
+            while current.timestamp - ordered[left].timestamp > duration:
+                left += 1
 
-    def test_missing_record(self):
-        import socket
+            window = ordered[left:right + 1]
+            count = len(window) if key is None else len({key(i) for i in window})
 
-        with mock.patch("socket.gethostbyaddr", side_effect=socket.herror(1, "x")):
-            self.assertEqual(reverse_dns("1.2.3.4", 2), (None, "No PTR record found."))
+            if count >= threshold:
+                start = left if start is None else start
+                end = right
+            elif start is not None:
+                matches.append(ordered[start:end + 1])
+                start = end = None
 
-    def test_other_errors_do_not_raise(self):
-        with mock.patch("socket.gethostbyaddr", side_effect=OSError("network down")):
-            hostname, message = reverse_dns("1.2.3.4", 2)
+        if start is not None:
+            matches.append(ordered[start:end + 1])
 
-        self.assertIsNone(hostname)
-        self.assertIn("network down", message)
+        return matches
 
-    def test_slow_lookups_time_out(self):
-        with mock.patch("socket.gethostbyaddr", side_effect=lambda a: (time.sleep(2), ("late", [], []))[1]):
-            started = time.time()
-            hostname, message = reverse_dns("1.2.3.4", 0.3)
+    def test_windows_match_the_reference_implementation(self):
+        generator = random.Random(7)
 
-        self.assertLess(time.time() - started, 2)
-        self.assertIsNone(hostname)
-        self.assertIn("timed out", message)
+        for _ in range(150):
+            events = [
+                event(generator.randint(0, 3000), ip=f"10.0.0.{generator.randint(1, 6)}")
+                for _ in range(generator.randint(0, 50))
+            ]
+
+            for key in (None, lambda item: item.source_ip):
+                for threshold in (2, 4):
+                    self.assertEqual(
+                        find_event_windows(events, 10, threshold, key),
+                        self.reference(events, 10, threshold, key),
+                    )
+
+    def test_invalid_parameters(self):
+        with self.assertRaises(ValueError):
+            find_event_windows([], 0, 5)
+
+        with self.assertRaises(ValueError):
+            find_event_windows([], 5, 0)
+
+    def test_large_inputs_are_processed_in_linear_time(self):
+        events = [event(i // 10) for i in range(40_000)]
+
+        self.assertEqual(len(find_event_windows(events, 10, 5)), 1)
+
+    def test_invalid_user_and_failure_of_one_attempt_count_once(self):
+        events = [
+            event(0, kind=EventType.SSH_INVALID_USER, pid=7),
+            event(1, kind=EventType.SSH_LOGIN_FAILED, pid=7),
+            event(2, kind=EventType.SSH_LOGIN_FAILED, pid=8),
+            event(3, kind=EventType.SSH_LOGIN_FAILED, pid=9),
+        ]
+
+        self.assertEqual(len(deduplicate_ssh_failures(events)), 3)
+
+    def test_success_after_failures(self):
+        events = [event(i * 10) for i in range(3)]
+        events.append(event(60, kind=EventType.SSH_LOGIN_SUCCESS))
+
+        found = find_success_after_failures(events, 3, 15)
+
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0][1]), 3)
+        self.assertEqual(find_success_after_failures(events, 4, 15), [])
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/redirect":
-            self.send_response(302)
-            self.send_header("Location", "http://example.com/x")
-            self.end_headers()
-            return
+class FilterTests(unittest.TestCase):
+    def setUp(self):
+        self.events = [
+            event(0, ip="1.1.1.1", user="root"),
+            event(60, ip="2.2.2.2", user="alice"),
+            event(120, ip="2.2.2.2", user="alice", kind=EventType.SSH_LOGIN_SUCCESS),
+        ]
 
-        body = {
-            "/big": b"x" * (lookup.MAX_RESPONSE_BYTES + 10),
-            "/text": b"not json",
-            "/list": b"[1, 2]",
-            "/ok": b'{"name": "fine"}',
-        }.get(self.path, b"{}")
+    def test_by_address_user_and_type(self):
+        by_ip = filter_events(self.events, create_filters(source_ip="2.2.2.2"))
+        by_user = filter_events(self.events, create_filters(username="root"))
+        by_type = filter_events(
+            self.events,
+            create_filters(event_types=["ssh_login_success"]),
+        )
 
-        self.send_response(404 if self.path == "/missing" else 200)
-        self.end_headers()
-        self.wfile.write(body)
+        self.assertEqual(len(by_ip), 2)
+        self.assertEqual(len(by_user), 1)
+        self.assertEqual(len(by_type), 1)
 
-    def log_message(self, *args):
-        pass
+    def test_by_time_range_in_the_configured_zone(self):
+        filters = create_filters(
+            start_date="2026-10-13T21:00:30",   # 00:00:30 UTC
+            end_date="2026-10-13T21:01:30",
+            timezone_name="America/Argentina/Buenos_Aires",
+        )
 
+        self.assertEqual(len(filter_events(self.events, filters)), 1)
 
-class FetchTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-
-    def fetch(self, path):
-        return lookup.fetch_json(self.base + path, 3)
-
-    def test_valid_response(self):
-        self.assertEqual(self.fetch("/ok"), {"name": "fine"})
-
-    def test_rejected_responses(self):
-        for path, text in (
-            ("/big", "too large"),
-            ("/text", "not valid JSON"),
-            ("/list", "Unexpected"),
-            ("/missing", "HTTP 404"),
-            ("/redirect", "HTTP 302"),
+    def test_invalid_values(self):
+        for kwargs in (
+            {"source_ip": "999.1.1.1"},
+            {"event_types": ["not_a_type"]},
+            {"start_date": "yesterday"},
+            {"start_date": "2026-10-15", "end_date": "2026-10-14"},
         ):
-            with self.subTest(path=path):
-                with self.assertRaises(RdapError) as context:
-                    self.fetch(path)
-
-                self.assertIn(text, str(context.exception))
-
-    def test_connection_failure(self):
-        with self.assertRaises(RdapError):
-            lookup.fetch_json("http://127.0.0.1:9/", 1)
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    create_filters(**kwargs)
 
 
-class AnalyzerTests(unittest.TestCase):
-    def analyze(self, address, **kwargs):
-        options = {"known_ips": None, "resolve": False, "rdap": False, "timeout": 2}
-        options.update(kwargs)
-
-        return analyze_address(AddressEntry(address, ["argument"]), **options)
-
-    def test_invalid_address(self):
-        result = self.analyze("nope")
-
-        self.assertIsNone(result.classification)
-        self.assertIn("Invalid", result.error)
-
-    def test_approval_status(self):
-        self.assertIsNone(self.analyze("8.8.8.8").approved)
-        self.assertTrue(self.analyze("8.8.8.8", known_ips={"8.8.8.8"}).approved)
-        self.assertFalse(self.analyze("8.8.8.8", known_ips={"1.1.1.1"}).approved)
-
-    def test_lookups_are_skipped_when_they_do_not_apply(self):
-        private = self.analyze("10.0.0.1", rdap=True)
-        multicast = self.analyze("224.0.0.1", resolve=True)
-
-        self.assertIn("Skipped", private.lookup_messages["rdap"])
-        self.assertIsNone(private.rdap)
-        self.assertIn("Skipped", multicast.lookup_messages["dns"])
-
-    def test_network_lookups_are_used_for_global_addresses(self):
-        with mock.patch("src.ip.analyzer.reverse_dns", return_value=("dns.google", None)), \
-                mock.patch("src.ip.analyzer.lookup_rdap", return_value="info"):
-            result = self.analyze("8.8.8.8", resolve=True, rdap=True)
-
-        self.assertEqual(result.hostname, "dns.google")
-        self.assertEqual(result.rdap, "info")
-
-    def test_lookup_failures_do_not_stop_the_analysis(self):
-        with mock.patch("src.ip.analyzer.lookup_rdap", side_effect=RdapError("boom")):
-            result = self.analyze("8.8.8.8", rdap=True)
-
-        self.assertEqual(result.lookup_messages["rdap"], "boom")
-        self.assertEqual(result.classification.category, "global")
-
-    def test_order_is_preserved_with_concurrent_lookups(self):
-        entries = [AddressEntry(f"8.8.8.{i}", ["argument"]) for i in range(1, 9)]
-
-        with mock.patch("src.ip.analyzer.reverse_dns", return_value=(None, "none")):
-            results = analyze_addresses(entries, None, True, False, 2)
-
-        self.assertEqual([r.input for r in results], [e.raw for e in entries])
-
-
-class CommandLineTests(unittest.TestCase):
+class ReaderTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
 
-    def test_offline_analysis(self):
-        code, output = run_cli("ip", "analyze", "8.8.8.8", "10.0.0.5", "::ffff:1.2.3.4")
+    def test_discovers_log_files_and_rotations(self):
+        for name in ("auth.log", "auth.log.1", "syslog", "app.log", "notes.txt"):
+            (self.root / name).write_text("x\n")
+
+        with gzip.open(self.root / "auth.log.2.gz", "wt") as stream:
+            stream.write("x\n")
+
+        found = {path.name for path in discover_log_files(self.root).files}
+
+        self.assertEqual(
+            found,
+            {"auth.log", "auth.log.1", "auth.log.2.gz", "syslog", "app.log"},
+        )
+
+    def test_recursive_discovery(self):
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "auth.log").write_text("x\n")
+
+        self.assertEqual(discover_log_files(self.root).files, [])
+        self.assertEqual(len(discover_log_files(self.root, recursive=True).files), 1)
+
+    @requires_linux
+    def test_symbolic_links_are_skipped(self):
+        (self.root / "real.log").write_text("x\n")
+        (self.root / "link.log").symlink_to(self.root / "real.log")
+
+        found = {path.name for path in discover_log_files(self.root).files}
+
+        self.assertEqual(found, {"real.log"})
+
+    def test_reads_plain_and_compressed_files(self):
+        plain = self.root / "a.log"
+        plain.write_text("one\ntwo\n")
+        packed = self.root / "b.log.gz"
+
+        with gzip.open(packed, "wt") as stream:
+            stream.write("three\n")
+
+        self.assertEqual([line.content for line in read_log_lines(plain)], ["one", "two"])
+        self.assertEqual([line.content for line in read_log_lines(packed)], ["three"])
+
+    def test_missing_target(self):
+        with self.assertRaises(ValueError):
+            discover_log_files(self.root / "missing")
+
+
+class DetectorTests(LogTestCase):
+    def test_brute_force(self):
+        lines = [failed_login(minute, "198.51.100.7") for minute in range(6)]
+
+        findings = self.analyze(lines).findings
+
+        self.assertEqual([f.rule_id for f in findings], ["brute_force"])
+        self.assertEqual(findings[0].source_ip, "198.51.100.7")
+        self.assertEqual(findings[0].event_count, 6)
+
+    def test_slow_or_small_attempts_are_not_brute_force(self):
+        few = [failed_login(minute, "198.51.100.7") for minute in range(4)]
+        slow = [failed_login(minute * 5, "198.51.100.7") for minute in range(6)]
+
+        self.assertEqual(self.rules(few), [])
+        self.assertEqual(self.rules(slow), [])
+
+    def test_threshold_is_configurable(self):
+        from src.logs.config import ThresholdConfig
+
+        lines = [failed_login(minute, "198.51.100.7") for minute in range(3)]
+
+        self.assertEqual(
+            self.rules(lines, brute_force=ThresholdConfig(3, 10)),
+            ["brute_force"],
+        )
+
+    def test_password_spraying(self):
+        lines = [
+            failed_login(minute, "198.51.100.7", user=f"user{minute}")
+            for minute in range(6)
+        ]
+
+        self.assertIn("password_spraying", self.rules(lines))
+
+    def test_distributed_attack(self):
+        lines = [
+            failed_login(minute, f"192.0.2.{10 + minute}", user="admin")
+            for minute in range(6)
+        ]
+
+        findings = self.analyze(lines).findings
+
+        self.assertEqual([f.rule_id for f in findings], ["distributed_attack"])
+        self.assertEqual(findings[0].username, "admin")
+        self.assertEqual(findings[0].severity.value, "HIGH")
+
+    def test_success_after_failures(self):
+        lines = [failed_login(minute, "198.51.100.9", user="alice", hour=10) for minute in range(3)]
+        lines.append(syslog(14, 10, 5, 0, "sshd", "Accepted password for alice from 198.51.100.9 port 1 ssh2", 200))
+
+        findings = self.analyze(lines).findings
+
+        self.assertEqual([f.rule_id for f in findings], ["successful_after_failures"])
+        self.assertEqual(findings[0].severity.value, "HIGH")
+
+    def test_login_outside_business_hours(self):
+        sunday = syslog(18, 3, 0, 0, "sshd", "Accepted publickey for alice from 10.0.0.5 port 22 ssh2")
+        weekday = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for alice from 10.0.0.5 port 22 ssh2")
+
+        self.assertEqual(self.rules([sunday]), ["outside_business_hours"])
+        self.assertEqual(self.rules([weekday]), [])
+
+    def test_new_source_ip_needs_a_baseline(self):
+        login = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for alice from 203.0.113.9 port 22 ssh2")
+
+        without = self.analyze([login])
+        known = self.analyze([login], known_ips={"10.0.0.5"})
+        approved = self.analyze([login], known_ips={"203.0.113.9"})
+
+        self.assertEqual(without.findings, [])
+        self.assertTrue(any("baseline" in warning for warning in without.warnings))
+        self.assertEqual([f.rule_id for f in known.findings], ["new_source_ip"])
+        self.assertEqual(approved.findings, [])
+
+    def test_privileged_activity(self):
+        sudo = syslog(14, 10, 0, 0, "sudo", "alice : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/bin/ls", 300)
+        root = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for root from 10.0.0.5 port 22 ssh2", 500)
+
+        self.assertEqual(self.rules([sudo]), ["privileged_activity"])
+        self.assertEqual(self.analyze([root]).findings[0].severity.value, "HIGH")
+
+    def test_account_changes(self):
+        line = syslog(14, 10, 0, 0, "useradd", "new user: name=bob, UID=1001, GID=1001, home=/home/bob", 600)
+
+        findings = self.analyze([line]).findings
+
+        self.assertEqual([f.rule_id for f in findings], ["account_changes"])
+        self.assertEqual(findings[0].username, "bob")
+
+    def test_repeated_service_errors(self):
+        lines = [syslog(14, 10, i, 0, "nginx", "connect() failed: error", 700 + i) for i in range(6)]
+
+        self.assertEqual(self.rules(lines), ["service_errors"])
+
+    def test_disabled_rules_are_skipped(self):
+        lines = [failed_login(minute, "198.51.100.7") for minute in range(6)]
+
+        self.assertEqual(self.rules(lines, enabled_rules=frozenset({"service_errors"})), [])
+
+    def test_counts_unparsed_lines(self):
+        result = self.analyze(["garbage", failed_login(0, "1.2.3.4")])
+
+        self.assertEqual(result.lines_unparsed, 1)
+        self.assertEqual(len(result.events), 1)
+
+    def test_invalid_month_is_reported_without_stopping(self):
+        result = self.analyze(["Foo 14 10:00:00 srv sshd[1]: x", failed_login(0, "1.2.3.4")])
+
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(len(result.errors), 1)
+
+
+class IpHistoryTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "nested" / "known.json"
+
+    def test_missing_file_means_no_baseline(self):
+        self.assertIsNone(load_known_ips(self.path))
+
+    def test_save_load_approve_and_revoke(self):
+        save_known_ips(self.path, {"10.0.0.5"})
+
+        self.assertEqual(load_known_ips(self.path), {"10.0.0.5"})
+        self.assertEqual(
+            approve_ips(self.path, ["10.0.0.6", "2001:db8::1"]),
+            {"10.0.0.5", "10.0.0.6", "2001:db8::1"},
+        )
+        self.assertEqual(revoke_ips(self.path, ["10.0.0.5"]), {"10.0.0.6", "2001:db8::1"})
+
+    def test_rejects_invalid_addresses(self):
+        with self.assertRaises(ValueError):
+            approve_ips(self.path, ["not-an-ip"])
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def write(self, text):
+        path = self.root / "config.yaml"
+        path.write_text(text)
+        return path
+
+    def test_defaults(self):
+        config = load_config(None)
+
+        self.assertEqual(config.timezone, "UTC")
+        self.assertEqual(config.brute_force.threshold, 5)
+        self.assertEqual(config.enabled_rules, frozenset(AVAILABLE_RULES))
+
+    def test_overrides(self):
+        config = load_config(self.write(
+            "timezone: America/Argentina/Buenos_Aires\n"
+            "brute_force:\n  threshold: 3\n  window_minutes: 20\n"
+        ))
+
+        self.assertEqual(config.timezone, "America/Argentina/Buenos_Aires")
+        self.assertEqual(config.brute_force.threshold, 3)
+        self.assertEqual(config.brute_force.window_minutes, 20)
+
+    def test_invalid_configuration(self):
+        for text in (
+            "unknown_key: 1\n",
+            "timezone: Not/AZone\n",
+            "brute_force:\n  threshold: 0\n  window_minutes: 5\n",
+            "brute_force: 5\n",
+            "- a list\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    load_config(self.write(text))
+
+
+class CommandLineTests(LogTestCase):
+    def test_analyze_and_export_json(self):
+        log = self.write_log([failed_login(minute, "198.51.100.7") for minute in range(6)])
+        config = self.root / "config.yaml"
+        config.write_text(f"ip_history_path: {self.baseline_path}\n")
+        report = self.root / "report.json"
+
+        code, output = run_cli(
+            "logs", "--config", config, "analyze", log,
+            "--year", 2026, "--json", report,
+        )
 
         self.assertEqual(code, 0, output)
-        self.assertIn("8.8.8.8 | IPv4 | global", output)
-        self.assertIn("10.0.0.5 | IPv4 | private", output)
-        self.assertIn("1.2.3.4 | IPv4 | global", output)
+        self.assertIn("brute-force", output.lower())
+        data = json.loads(report.read_text())
+        self.assertEqual([f["rule_id"] for f in data["findings"]], ["brute_force"])
+        self.assertIn("warnings", data)
 
-    def test_invalid_input_gives_exit_code_2(self):
-        code, output = run_cli("ip", "analyze", "999.1.1.1")
+    def test_errors_are_reported_with_exit_code_2(self):
+        code, output = run_cli("logs", "analyze", self.root / "missing.log")
 
-        self.assertEqual(code, 2)
-        self.assertIn("[INVALID]", output)
+        self.assertNotEqual(code, 0)
+        self.assertIn("Error", output)
 
-    def test_usage_errors(self):
-        self.assertEqual(run_cli("ip", "analyze")[0], 2)
-        self.assertEqual(run_cli("ip", "analyze", "1.1.1.1", "--timeout", "0")[0], 2)
-        self.assertEqual(run_cli("ip", "analyze", "1.1.1.1", "--limit", "0")[0], 2)
+    def test_baseline_management(self):
+        config = self.root / "config.yaml"
+        config.write_text(f"ip_history_path: {self.baseline_path}\n")
 
-    def test_standard_input_and_json_export(self):
-        target = self.root / "out.json"
+        self.assertEqual(run_cli("logs", "--config", config, "ips", "init")[0], 0)
+        self.assertNotEqual(run_cli("logs", "--config", config, "ips", "init")[0], 0)
+        run_cli("logs", "--config", config, "ips", "approve", "10.0.0.5")
 
-        code, _ = run_cli(
-            "ip", "analyze", "--file", "-", "--json", target,
-            input_text="1.1.1.1\n192.168.0.1\n",
-        )
-        data = json.loads(target.read_text())
+        code, output = run_cli("logs", "--config", config, "ips", "list")
 
         self.assertEqual(code, 0)
-        self.assertEqual(data["summary"]["total"], 2)
-        self.assertEqual(data["summary"]["global"], 1)
-
-    def test_report_from_the_log_analyzer(self):
-        report = self.root / "report.json"
-        report.write_text(json.dumps({"findings": [
-            {"rule_id": "brute_force", "severity": "HIGH", "source_ip": "198.51.100.7"},
-        ]}))
-
-        code, output = run_cli("ip", "analyze", "--from-report", report)
-
-        self.assertEqual(code, 0, output)
-        self.assertIn("max severity: HIGH", output)
+        self.assertIn("10.0.0.5", output)
 
 
 if __name__ == "__main__":

@@ -105,6 +105,8 @@ def fetch_json(url: str, timeout: float) -> dict:
         with opener.open(request, timeout=timeout) as response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
+        error.close()
+
         raise RdapError(
             f"RDAP server returned HTTP {error.code}."
         ) from error

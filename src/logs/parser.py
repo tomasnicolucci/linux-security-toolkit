@@ -1,3 +1,4 @@
+
 import ipaddress
 import json
 import re
@@ -65,7 +66,8 @@ SUDO_COMMAND = re.compile(
 
 SUDO_FAILURE = re.compile(
     r"(?:authentication failure|incorrect password|"
-    r"\d+ incorrect password attempts)",
+    r"\d+ incorrect password attempts|NOT in sudoers|"
+    r"command not allowed)",
     re.IGNORECASE,
 )
 
@@ -277,6 +279,24 @@ def extract_event_details(
             )
 
     if service_name.startswith("sudo"):
+        # Failed attempts also contain "COMMAND=" (the command that was
+        # refused), so failures must be recognized first. Only the part
+        # before the command is inspected.
+        if SUDO_FAILURE.search(message.split("COMMAND=", 1)[0]):
+            pam_user = PAM_USER.search(message)
+
+            if pam_user:
+                user = pam_user.group("user")
+            else:
+                user = message.split(":", 1)[0].strip()
+
+            return (
+                EventType.SUDO_AUTH_FAILED,
+                user if user and " " not in user else None,
+                None,
+                metadata,
+            )
+
         match = SUDO_COMMAND.search(message)
 
         if match:
@@ -285,16 +305,6 @@ def extract_event_details(
             return (
                 EventType.SUDO_COMMAND,
                 match.group("user"),
-                None,
-                metadata,
-            )
-
-        if SUDO_FAILURE.search(message):
-            user = message.split(":", 1)[0].strip()
-
-            return (
-                EventType.SUDO_AUTH_FAILED,
-                user if user and " " not in user else None,
                 None,
                 metadata,
             )

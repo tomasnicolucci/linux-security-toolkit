@@ -1,574 +1,591 @@
-import gzip
 import json
-import random
+import os
+import stat
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from unittest import mock
 
-from src.logs.config import AVAILABLE_RULES, load_config
-from src.logs.correlation import (
-    deduplicate_ssh_failures,
-    find_event_windows,
-    find_success_after_failures,
+from src.network import procfs, watch
+from src.network.baseline import (
+    compare_baseline,
+    create_baseline,
+    load_baseline,
 )
-from src.logs.filters import create_filters, filter_events
-from src.logs.ip_history import (
-    approve_ips,
-    load_known_ips,
-    revoke_ips,
-    save_known_ips,
+from src.network.models import NetworkError
+from src.network.procfs import bind_scope, collect_snapshot, decode_address
+from src.network.rules import RuleOptions, analyze, sort_findings
+from src.network.service import (
+    public_remote_ips,
+    select_sockets,
+    state_counts,
 )
-from src.logs.models import EventType, SecurityEvent
-from src.logs.parser import parse_log_line
-from src.logs.reader import discover_log_files, read_log_lines, LogLine
-from tests.helpers import requires_linux, run_cli
-from tests.logs_support import LogTestCase, failed_login, syslog
-
-BUENOS_AIRES = ZoneInfo("America/Argentina/Buenos_Aires")
+from tests.helpers import requires_linux, run_module
+from tests.proc_fixtures import ANY, FakeProc, scenario
 
 
-def parse(content, **kwargs):
-    return parse_log_line(LogLine("test.log", 1, content), **kwargs)
+def find(findings, rule_id, text=""):
+    return [f for f in findings if f.rule_id == rule_id and text in f.title + f.subject]
 
 
-def event(seconds, ip="1.1.1.1", user="root", kind=EventType.SSH_LOGIN_FAILED,
-          pid=None):
-    base = datetime(2026, 10, 14, tzinfo=timezone.utc)
-
-    return SecurityEvent(
-        timestamp=base + timedelta(seconds=seconds),
-        event_type=kind,
-        source="t.log",
-        line_number=seconds,
-        service="sshd",
-        message="x",
-        source_ip=ip,
-        username=user,
-        process_id=pid,
-    )
-
-
-class ParserTests(unittest.TestCase):
-    def test_ssh_events(self):
-        failed = parse(
-            "Oct 14 03:00:00 srv sshd[10]: Failed password for root "
-            "from 198.51.100.7 port 22 ssh2",
-            year=2026,
-        )
-        invalid = parse(
-            "Oct 14 03:00:00 srv sshd[10]: Invalid user zed "
-            "from 198.51.100.7 port 22",
-            year=2026,
-        )
-        accepted = parse(
-            "Oct 14 03:00:00 srv sshd[10]: Accepted publickey for alice "
-            "from 2001:db8::1 port 22 ssh2",
-            year=2026,
-        )
-
-        self.assertEqual(failed.event_type, EventType.SSH_LOGIN_FAILED)
-        self.assertEqual((failed.username, failed.source_ip), ("root", "198.51.100.7"))
-        self.assertEqual(failed.process_id, 10)
-        self.assertEqual(invalid.event_type, EventType.SSH_INVALID_USER)
-        self.assertEqual(invalid.username, "zed")
-        self.assertEqual(accepted.event_type, EventType.SSH_LOGIN_SUCCESS)
-        self.assertEqual(accepted.source_ip, "2001:db8::1")
-
-    def test_failure_for_invalid_user_keeps_the_user_name(self):
-        item = parse(
-            "Oct 14 03:00:00 srv sshd[10]: Failed password for invalid "
-            "user guest from 198.51.100.7 port 22 ssh2",
-            year=2026,
-        )
-
-        self.assertEqual(item.username, "guest")
-
-    def test_privilege_and_account_events(self):
-        cases = {
-            "sudo[1]: alice : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/bin/ls":
-                EventType.SUDO_COMMAND,
-            "sudo[1]: alice : 3 incorrect password attempts ; COMMAND=/bin/ls":
-                EventType.SUDO_AUTH_FAILED,
-            "su[1]: Successful su for root by alice": EventType.SU_SUCCESS,
-            "su[1]: FAILED SU (to root) alice on pts/0": EventType.SU_FAILED,
-            "useradd[1]: new user: name=bob, UID=1001, GID=1001":
-                EventType.USER_CREATED,
-            "userdel[1]: delete user 'bob'": EventType.USER_DELETED,
-            "passwd[1]: password changed for alice":
-                EventType.PASSWORD_CHANGED,
-            "groupadd[1]: new group: name=ops, GID=1100":
-                EventType.GROUP_CREATED,
-            "nginx[1]: connect() failed: error": EventType.SERVICE_ERROR,
-            "cron[1]: job started": EventType.UNKNOWN,
-        }
-
-        for message, expected in cases.items():
-            with self.subTest(message=message):
-                item = parse(f"Oct 14 10:00:00 srv {message}", year=2026)
-                self.assertEqual(item.event_type, expected)
-
-    def test_refused_sudo_attempts_are_failures_even_with_a_command(self):
-        # Real sudo logs the refused command too ("COMMAND=...").
-        cases = {
-            "alice : 3 incorrect password attempts ; TTY=pts/0 ; "
-            "PWD=/ ; USER=root ; COMMAND=/bin/ls": "alice",
-            "alice : user NOT in sudoers ; TTY=pts/0 ; PWD=/ ; "
-            "USER=root ; COMMAND=/bin/ls": "alice",
-            "pam_unix(sudo:auth): authentication failure; logname=bob "
-            "uid=1000 euid=0 tty=/dev/pts/0 ruser=bob rhost=  user=bob": "bob",
-        }
-
-        for message, user in cases.items():
-            with self.subTest(message=message):
-                item = parse(f"Oct 14 10:00:00 srv sudo[1]: {message}", year=2026)
-
-                self.assertEqual(item.event_type, EventType.SUDO_AUTH_FAILED)
-                self.assertEqual(item.username, user)
-
-    def test_a_command_that_mentions_failure_words_is_still_a_command(self):
-        item = parse(
-            "Oct 14 10:00:00 srv sudo[1]: alice : TTY=pts/0 ; USER=root ; "
-            "COMMAND=/bin/echo incorrect password",
-            year=2026,
-        )
-
-        self.assertEqual(item.event_type, EventType.SUDO_COMMAND)
-
-    def test_sudo_command_is_recorded(self):
-        item = parse(
-            "Oct 14 10:00:00 srv sudo[1]: alice : TTY=pts/0 ; "
-            "USER=root ; COMMAND=/bin/ls -l",
-            year=2026,
-        )
-
-        self.assertEqual(item.username, "alice")
-        self.assertEqual(item.metadata["command"], "/bin/ls -l")
-
-    def test_lines_that_are_not_logs_are_ignored(self):
-        self.assertIsNone(parse("this is not a log line"))
-        self.assertIsNone(parse("   "))
-
-    def test_month_names(self):
-        self.assertEqual(parse("Ene 19 12:00:00 srv sshd[1]: x", year=2026).timestamp.month, 1)
-
-        with self.assertRaises(ValueError):
-            parse("Foo 19 12:00:00 srv sshd[1]: x", year=2026)
-
-        with self.assertRaises(ValueError):
-            parse("Oct 32 12:00:00 srv sshd[1]: x", year=2026)
-
-    def test_timestamps_use_the_configured_zone(self):
-        expected = datetime(2026, 10, 19, 15, 0, tzinfo=timezone.utc)
-
-        syslog_item = parse("Oct 19 12:00:00 srv sshd[1]: x", year=2026, tz=BUENOS_AIRES)
-        naive_iso = parse("2026-10-19T12:00:00 srv sshd[1]: x", tz=BUENOS_AIRES)
-        offset_iso = parse("2026-10-19T12:00:00-03:00 srv sshd[1]: x", tz=BUENOS_AIRES)
-
-        self.assertEqual(syslog_item.timestamp, expected)
-        self.assertEqual(naive_iso.timestamp, expected)
-        self.assertEqual(offset_iso.timestamp, expected)
-
-    def test_journal_json_lines(self):
-        line = json.dumps({
-            "MESSAGE": "Failed password for root from 203.0.113.2 port 1 ssh2",
-            "__REALTIME_TIMESTAMP": "1792400000000000",
-            "SYSLOG_IDENTIFIER": "sshd",
-            "_PID": "9",
-            "_HOSTNAME": "srv",
-        })
-
-        item = parse(line)
-
-        self.assertEqual(item.event_type, EventType.SSH_LOGIN_FAILED)
-        self.assertEqual(item.process_id, 9)
-        self.assertEqual(item.timestamp.tzinfo, timezone.utc)
-
-
-class CorrelationTests(unittest.TestCase):
-    @staticmethod
-    def reference(events, minutes, threshold, key=None):
-        """Straightforward (slow) implementation used as a reference."""
-        ordered = sorted(events, key=lambda e: (e.timestamp, e.source, e.line_number))
-        duration = timedelta(minutes=minutes)
-        matches, left, start, end = [], 0, None, None
-
-        for right, current in enumerate(ordered):
-            while current.timestamp - ordered[left].timestamp > duration:
-                left += 1
-
-            window = ordered[left:right + 1]
-            count = len(window) if key is None else len({key(i) for i in window})
-
-            if count >= threshold:
-                start = left if start is None else start
-                end = right
-            elif start is not None:
-                matches.append(ordered[start:end + 1])
-                start = end = None
-
-        if start is not None:
-            matches.append(ordered[start:end + 1])
-
-        return matches
-
-    def test_windows_match_the_reference_implementation(self):
-        generator = random.Random(7)
-
-        for _ in range(150):
-            events = [
-                event(generator.randint(0, 3000), ip=f"10.0.0.{generator.randint(1, 6)}")
-                for _ in range(generator.randint(0, 50))
-            ]
-
-            for key in (None, lambda item: item.source_ip):
-                for threshold in (2, 4):
-                    self.assertEqual(
-                        find_event_windows(events, 10, threshold, key),
-                        self.reference(events, 10, threshold, key),
-                    )
-
-    def test_invalid_parameters(self):
-        with self.assertRaises(ValueError):
-            find_event_windows([], 0, 5)
-
-        with self.assertRaises(ValueError):
-            find_event_windows([], 5, 0)
-
-    def test_large_inputs_are_processed_in_linear_time(self):
-        events = [event(i // 10) for i in range(40_000)]
-
-        self.assertEqual(len(find_event_windows(events, 10, 5)), 1)
-
-    def test_invalid_user_and_failure_of_one_attempt_count_once(self):
-        events = [
-            event(0, kind=EventType.SSH_INVALID_USER, pid=7),
-            event(1, kind=EventType.SSH_LOGIN_FAILED, pid=7),
-            event(2, kind=EventType.SSH_LOGIN_FAILED, pid=8),
-            event(3, kind=EventType.SSH_LOGIN_FAILED, pid=9),
-        ]
-
-        self.assertEqual(len(deduplicate_ssh_failures(events)), 3)
-
-    def test_success_after_failures(self):
-        events = [event(i * 10) for i in range(3)]
-        events.append(event(60, kind=EventType.SSH_LOGIN_SUCCESS))
-
-        found = find_success_after_failures(events, 3, 15)
-
-        self.assertEqual(len(found), 1)
-        self.assertEqual(len(found[0][1]), 3)
-        self.assertEqual(find_success_after_failures(events, 4, 15), [])
-
-
-class FilterTests(unittest.TestCase):
-    def setUp(self):
-        self.events = [
-            event(0, ip="1.1.1.1", user="root"),
-            event(60, ip="2.2.2.2", user="alice"),
-            event(120, ip="2.2.2.2", user="alice", kind=EventType.SSH_LOGIN_SUCCESS),
-        ]
-
-    def test_by_address_user_and_type(self):
-        by_ip = filter_events(self.events, create_filters(source_ip="2.2.2.2"))
-        by_user = filter_events(self.events, create_filters(username="root"))
-        by_type = filter_events(
-            self.events,
-            create_filters(event_types=["ssh_login_success"]),
-        )
-
-        self.assertEqual(len(by_ip), 2)
-        self.assertEqual(len(by_user), 1)
-        self.assertEqual(len(by_type), 1)
-
-    def test_by_time_range_in_the_configured_zone(self):
-        filters = create_filters(
-            start_date="2026-10-13T21:00:30",   # 00:00:30 UTC
-            end_date="2026-10-13T21:01:30",
-            timezone_name="America/Argentina/Buenos_Aires",
-        )
-
-        self.assertEqual(len(filter_events(self.events, filters)), 1)
-
-    def test_invalid_values(self):
-        for kwargs in (
-            {"source_ip": "999.1.1.1"},
-            {"event_types": ["not_a_type"]},
-            {"start_date": "yesterday"},
-            {"start_date": "2026-10-15", "end_date": "2026-10-14"},
-        ):
-            with self.subTest(kwargs=kwargs):
-                with self.assertRaises(ValueError):
-                    create_filters(**kwargs)
-
-
-class ReaderTests(unittest.TestCase):
-    def setUp(self):
+@requires_linux
+class NetworkTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
         directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        cls.directory = directory
+        cls.root = Path(directory.name)
+        cls.proc = scenario(cls.root / "proc")
 
-    def test_discovers_log_files_and_rotations(self):
-        for name in ("auth.log", "auth.log.1", "syslog", "app.log", "notes.txt"):
-            (self.root / name).write_text("x\n")
+        with mock.patch.object(procfs, "user_name", lambda uid: f"user{uid}"):
+            cls.snapshot = collect_snapshot(cls.root / "proc")
 
-        with gzip.open(self.root / "auth.log.2.gz", "wt") as stream:
-            stream.write("x\n")
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
 
-        found = {path.name for path in discover_log_files(self.root).files}
 
-        self.assertEqual(
-            found,
-            {"auth.log", "auth.log.1", "auth.log.2.gz", "syslog", "app.log"},
-        )
+class ParsingTests(unittest.TestCase):
+    def test_ipv4_and_ipv6_addresses(self):
+        from tests.proc_fixtures import encode
 
-    def test_recursive_discovery(self):
-        (self.root / "sub").mkdir()
-        (self.root / "sub" / "auth.log").write_text("x\n")
+        for ip, port in (("192.0.2.10", 443), ("127.0.0.1", 22), ("0.0.0.0", 0),
+                         ("2001:db8::10", 8080), ("::", 0), ("::1", 25)):
+            with self.subTest(ip=ip):
+                self.assertEqual(decode_address(encode(ip, port), 6 if ":" in ip else 4), (ip, port))
 
-        self.assertEqual(discover_log_files(self.root).files, [])
-        self.assertEqual(len(discover_log_files(self.root, recursive=True).files), 1)
+    def test_ipv4_mapped_addresses_become_ipv4(self):
+        from tests.proc_fixtures import encode
+
+        self.assertEqual(decode_address(encode("::ffff:10.1.2.3", 80), 6), ("10.1.2.3", 80))
+
+    def test_bind_scope(self):
+        self.assertEqual(bind_scope("0.0.0.0"), "all")
+        self.assertEqual(bind_scope("::"), "all")
+        self.assertEqual(bind_scope("127.0.0.1"), "loopback")
+        self.assertEqual(bind_scope("::1"), "loopback")
+        self.assertEqual(bind_scope("192.168.1.5"), "specific")
+
+    def test_malformed_lines_are_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            table = Path(directory) / "tcp"
+            table.write_text("header\nthis is not a socket\n  0: ZZZZ:00 00:00 0A\n")
+
+            self.assertEqual(procfs.read_table(table, "tcp", 4), [])
 
     @requires_linux
-    def test_symbolic_links_are_skipped(self):
-        (self.root / "real.log").write_text("x\n")
-        (self.root / "link.log").symlink_to(self.root / "real.log")
+    def test_missing_tables_are_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(NetworkError):
+                collect_snapshot(Path(directory))
 
-        found = {path.name for path in discover_log_files(self.root).files}
+    @requires_linux
+    def test_works_on_the_real_system(self):
+        snapshot = collect_snapshot()
 
-        self.assertEqual(found, {"real.log"})
-
-    def test_reads_plain_and_compressed_files(self):
-        plain = self.root / "a.log"
-        plain.write_text("one\ntwo\n")
-        packed = self.root / "b.log.gz"
-
-        with gzip.open(packed, "wt") as stream:
-            stream.write("three\n")
-
-        self.assertEqual([line.content for line in read_log_lines(plain)], ["one", "two"])
-        self.assertEqual([line.content for line in read_log_lines(packed)], ["three"])
-
-    def test_missing_target(self):
-        with self.assertRaises(ValueError):
-            discover_log_files(self.root / "missing")
+        self.assertIsInstance(snapshot.sockets, list)
+        self.assertTrue(snapshot.host)
 
 
-class DetectorTests(LogTestCase):
-    def test_brute_force(self):
-        lines = [failed_login(minute, "198.51.100.7") for minute in range(6)]
+class SnapshotTests(NetworkTestCase):
+    def test_listeners_and_ephemeral_udp(self):
+        ports = {(item.proto, item.local_port) for item in self.snapshot.listeners}
 
-        findings = self.analyze(lines).findings
+        self.assertIn(("tcp", 22), ports)
+        self.assertIn(("udp", 53), ports)
+        self.assertNotIn(("udp", 45000), ports)
 
-        self.assertEqual([f.rule_id for f in findings], ["brute_force"])
-        self.assertEqual(findings[0].source_ip, "198.51.100.7")
-        self.assertEqual(findings[0].event_count, 6)
+    def test_processes_are_linked_to_sockets(self):
+        nginx = [s for s in self.snapshot.listeners if s.local_port == 80][0]
 
-    def test_slow_or_small_attempts_are_not_brute_force(self):
-        few = [failed_login(minute, "198.51.100.7") for minute in range(4)]
-        slow = [failed_login(minute * 5, "198.51.100.7") for minute in range(6)]
+        self.assertEqual(nginx.process.name, "nginx")
+        self.assertEqual(nginx.pids, (100, 101))
+        self.assertEqual(nginx.process.pid, 100)
+        self.assertEqual(nginx.scope, "all")
+        self.assertEqual(nginx.process.user, "user0")
 
-        self.assertEqual(self.rules(few), [])
-        self.assertEqual(self.rules(slow), [])
+    def test_scopes(self):
+        scopes = {s.local_port: s.scope for s in self.snapshot.listeners if s.proto == "tcp"}
 
-    def test_threshold_is_configurable(self):
-        from src.logs.config import ThresholdConfig
+        self.assertEqual(scopes[5432], "loopback")
+        self.assertEqual(scopes[7000], "loopback")
+        self.assertEqual(scopes[6379], "all")
 
-        lines = [failed_login(minute, "198.51.100.7") for minute in range(3)]
+    def test_command_lines_and_deleted_programs(self):
+        by_pid = {s.process.pid: s.process for s in self.snapshot.sockets if s.process}
+
+        self.assertEqual(by_pid[200].cmdline, "redis-server *:6379")
+        self.assertTrue(by_pid[700].deleted)
+        self.assertFalse(by_pid[100].deleted)
+
+    def test_sockets_without_owner(self):
+        nfs = [s for s in self.snapshot.listeners if s.local_port == 2049][0]
+
+        self.assertIsNone(nfs.process)
+        self.assertEqual(nfs.pids, ())
+
+    def test_hostile_text_is_sanitized(self):
+        p = FakeProc(self.root / "hostile")
+        p.process(1, "bad\x1b[31mname", "/usr/bin/x", "run \x1b[2J now", 0)
+        p.socket("tcp", (ANY, 80), (ANY, 0), "0A", 1)
+        p.write()
+
+        process = collect_snapshot(self.root / "hostile").sockets[0].process
+
+        self.assertNotIn("\x1b", process.name + process.cmdline)
+
+    def test_unreadable_processes_are_counted(self):
+        real = os.listdir
+
+        def deny(path, *args):
+            if str(path).endswith("/300/fd"):
+                raise PermissionError(13, "denied")
+
+            return real(path, *args)
+
+        with mock.patch("src.network.procfs.os.listdir", side_effect=deny):
+            snapshot = collect_snapshot(self.root / "proc")
+
+        self.assertEqual(snapshot.unreadable_processes, 1)
+        self.assertTrue(any("could not be inspected" in w for w in snapshot.warnings))
+
+    def test_large_tables_are_read_quickly(self):
+        import time
+
+        p = FakeProc(self.root / "big")
+
+        for i in range(20_000):
+            p.socket("tcp", (ANY, 80), (f"10.{(i >> 8) & 255}.{i & 255}.1", 1024 + i % 60000), "01")
+
+        p.write()
+        started = time.time()
+        snapshot = collect_snapshot(self.root / "big")
+
+        self.assertEqual(len(snapshot.sockets), 20_000)
+        self.assertLess(time.time() - started, 10)
+
+
+class RuleTests(NetworkTestCase):
+    def setUp(self):
+        self.findings = sort_findings(analyze(self.snapshot, RuleOptions()))
+
+    def test_risky_services_exposed(self):
+        exposed = {f.title.split(" is ")[0]: f.severity for f in find(self.findings, "NC-001")}
 
         self.assertEqual(
-            self.rules(lines, brute_force=ThresholdConfig(3, 10)),
-            ["brute_force"],
+            exposed,
+            {"Docker API": "CRITICAL", "Redis": "HIGH", "Memcached": "HIGH", "NFS": "MEDIUM"},
         )
 
-    def test_password_spraying(self):
-        lines = [
-            failed_login(minute, "198.51.100.7", user=f"user{minute}")
-            for minute in range(6)
-        ]
+    def test_services_that_are_fine_are_not_reported(self):
+        text = " ".join(f.subject + f.title for f in self.findings)
 
-        self.assertIn("password_spraying", self.rules(lines))
+        for name in ("nginx", "sshd", "postgres", "dnsmasq"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, text)
 
-    def test_distributed_attack(self):
-        lines = [
-            failed_login(minute, f"192.0.2.{10 + minute}", user="admin")
-            for minute in range(6)
-        ]
+    def test_loopback_services_are_never_exposed(self):
+        p = FakeProc(self.root / "local")
+        p.socket("tcp", ("127.0.0.1", 6379), (ANY, 0), "0A")
+        p.write()
 
-        findings = self.analyze(lines).findings
+        self.assertEqual(find(analyze(collect_snapshot(self.root / "local"), RuleOptions()), "NC-001"), [])
 
-        self.assertEqual([f.rule_id for f in findings], ["distributed_attack"])
-        self.assertEqual(findings[0].username, "admin")
-        self.assertEqual(findings[0].severity.value, "HIGH")
+    def test_deleted_programs(self):
+        by_process = {f.subject.split(" ")[0]: f.severity for f in find(self.findings, "NC-002")}
 
-    def test_success_after_failures(self):
-        lines = [failed_login(minute, "198.51.100.9", user="alice", hour=10) for minute in range(3)]
-        lines.append(syslog(14, 10, 5, 0, "sshd", "Accepted password for alice from 198.51.100.9 port 1 ssh2", 200))
+        self.assertEqual(by_process, {"apache2": "LOW", "evil": "CRITICAL", "kworker-x": "CRITICAL"})
+        self.assertIn("memory only", find(self.findings, "NC-002", "kworker")[0].title)
 
-        findings = self.analyze(lines).findings
+    def test_programs_in_temporary_directories(self):
+        names = sorted(f.subject.split(" ")[0] for f in find(self.findings, "NC-003"))
 
-        self.assertEqual([f.rule_id for f in findings], ["successful_after_failures"])
-        self.assertEqual(findings[0].severity.value, "HIGH")
+        self.assertEqual(names, [".x", "evil"])
 
-    def test_login_outside_business_hours(self):
-        sunday = syslog(18, 3, 0, 0, "sshd", "Accepted publickey for alice from 10.0.0.5 port 22 ssh2")
-        weekday = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for alice from 10.0.0.5 port 22 ssh2")
+    def test_shells_and_network_tools(self):
+        names = sorted(f.subject.split(" ")[0] for f in find(self.findings, "NC-009"))
 
-        self.assertEqual(self.rules([sunday]), ["outside_business_hours"])
-        self.assertEqual(self.rules([weekday]), [])
+        self.assertEqual(names, ["bash", "nc"])
 
-    def test_new_source_ip_needs_a_baseline(self):
-        login = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for alice from 203.0.113.9 port 22 ssh2")
+    def test_many_connections_from_one_address(self):
+        found = find(self.findings, "NC-006")
 
-        without = self.analyze([login])
-        known = self.analyze([login], known_ips={"10.0.0.5"})
-        approved = self.analyze([login], known_ips={"203.0.113.9"})
+        self.assertEqual([f.subject for f in found], ["198.51.100.99"])
+        self.assertEqual(find(analyze(self.snapshot, RuleOptions(max_per_ip=500)), "NC-006"), [])
 
-        self.assertEqual(without.findings, [])
-        self.assertTrue(any("baseline" in warning for warning in without.warnings))
-        self.assertEqual([f.rule_id for f in known.findings], ["new_source_ip"])
-        self.assertEqual(approved.findings, [])
+    def test_half_open_connections(self):
+        found = find(self.findings, "NC-007")
 
-    def test_privileged_activity(self):
-        sudo = syslog(14, 10, 0, 0, "sudo", "alice : TTY=pts/0 ; PWD=/ ; USER=root ; COMMAND=/bin/ls", 300)
-        root = syslog(14, 10, 0, 0, "sshd", "Accepted publickey for root from 10.0.0.5 port 22 ssh2", 500)
+        self.assertEqual([f.subject for f in found], ["tcp 80"])
+        self.assertEqual(find(analyze(self.snapshot, RuleOptions(syn_threshold=100)), "NC-007"), [])
 
-        self.assertEqual(self.rules([sudo]), ["privileged_activity"])
-        self.assertEqual(self.analyze([root]).findings[0].severity.value, "HIGH")
+    def test_listener_without_a_visible_process(self):
+        found = find(self.findings, "NC-008")
 
-    def test_account_changes(self):
-        line = syslog(14, 10, 0, 0, "useradd", "new user: name=bob, UID=1001, GID=1001, home=/home/bob", 600)
+        self.assertEqual(len(found), 1)
+        self.assertIn("2049", found[0].title)
 
-        findings = self.analyze([line]).findings
+    def test_no_orphan_finding_when_processes_could_not_be_inspected(self):
+        snapshot = collect_snapshot(self.root / "proc")
+        snapshot.unreadable_processes = 3
 
-        self.assertEqual([f.rule_id for f in findings], ["account_changes"])
-        self.assertEqual(findings[0].username, "bob")
+        self.assertEqual(find(analyze(snapshot, RuleOptions()), "NC-008"), [])
 
-    def test_repeated_service_errors(self):
-        lines = [syslog(14, 10, i, 0, "nginx", "connect() failed: error", 700 + i) for i in range(6)]
+    def test_findings_are_sorted_by_severity(self):
+        order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        values = [order[f.severity] for f in self.findings]
 
-        self.assertEqual(self.rules(lines), ["service_errors"])
-
-    def test_disabled_rules_are_skipped(self):
-        lines = [failed_login(minute, "198.51.100.7") for minute in range(6)]
-
-        self.assertEqual(self.rules(lines, enabled_rules=frozenset({"service_errors"})), [])
-
-    def test_counts_unparsed_lines(self):
-        result = self.analyze(["garbage", failed_login(0, "1.2.3.4")])
-
-        self.assertEqual(result.lines_unparsed, 1)
-        self.assertEqual(len(result.events), 1)
-
-    def test_invalid_month_is_reported_without_stopping(self):
-        result = self.analyze(["Foo 14 10:00:00 srv sshd[1]: x", failed_login(0, "1.2.3.4")])
-
-        self.assertEqual(len(result.events), 1)
-        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(values, sorted(values, reverse=True))
+        self.assertEqual(len(self.findings), 14)
 
 
-class IpHistoryTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / "nested" / "known.json"
+class ServiceTests(NetworkTestCase):
+    def select(self, **kwargs):
+        options = dict(listening_only=False, established_only=False, proto=None, port=None, pid=None)
+        options.update(kwargs)
 
-    def test_missing_file_means_no_baseline(self):
-        self.assertIsNone(load_known_ips(self.path))
+        return select_sockets(self.snapshot, **options)
 
-    def test_save_load_approve_and_revoke(self):
-        save_known_ips(self.path, {"10.0.0.5"})
+    def test_filters(self):
+        self.assertEqual({s.proto for s in self.select(listening_only=True, proto="udp").listeners}, {"udp"})
+        self.assertEqual(self.select(listening_only=True).connections, [])
+        self.assertEqual(self.select(established_only=True).listeners, [])
+        self.assertEqual([s.process.pid for s in self.select(established_only=True, pid=500).connections], [500])
+        self.assertEqual([s.local_port for s in self.select(listening_only=True, port=6379).listeners], [6379])
 
-        self.assertEqual(load_known_ips(self.path), {"10.0.0.5"})
+    def test_idle_and_closing_sockets_are_not_connections(self):
+        states = {s.state for s in self.select().connections}
+
+        self.assertNotIn("TIME_WAIT", states)
+        self.assertNotIn("LISTEN", states)
+
+    def test_state_counts(self):
+        counts = state_counts(self.snapshot)
+
+        self.assertEqual(counts["SYN_RECV"], 60)
+        self.assertEqual(counts["TIME_WAIT"], 30)
+
+    def test_public_remote_addresses_mix_versions_without_errors(self):
+        p = FakeProc(self.root / "public")
+        p.socket("tcp", ("192.0.2.10", 1), ("8.8.8.8", 443), "01")
+        p.socket("tcp", ("192.0.2.10", 2), ("8.8.8.8", 80), "01")
+        p.socket("tcp", ("192.0.2.10", 3), ("1.1.1.1", 443), "01")
+        p.socket("tcp", ("192.0.2.10", 4), ("10.0.0.5", 22), "01")
+        p.socket("tcp", ("192.0.2.10", 5), ("203.0.113.9", 22), "01")
+        p.socket("tcp6", ("2001:db8::10", 6), ("2606:4700:4700::1111", 443), "01")
+        p.write()
+
+        snapshot = collect_snapshot(self.root / "public")
+
         self.assertEqual(
-            approve_ips(self.path, ["10.0.0.6", "2001:db8::1"]),
-            {"10.0.0.5", "10.0.0.6", "2001:db8::1"},
+            public_remote_ips(snapshot.sockets),
+            ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"],
         )
-        self.assertEqual(revoke_ips(self.path, ["10.0.0.5"]), {"10.0.0.6", "2001:db8::1"})
-
-    def test_rejects_invalid_addresses(self):
-        with self.assertRaises(ValueError):
-            approve_ips(self.path, ["not-an-ip"])
 
 
-class ConfigTests(unittest.TestCase):
+class BaselineTests(NetworkTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        self.path = self.root / "baseline" / "baseline.json"
 
-    def write(self, text):
-        path = self.root / "config.yaml"
-        path.write_text(text)
-        return path
+        if self.path.exists():
+            self.path.unlink()
 
-    def test_defaults(self):
-        config = load_config(None)
+    def changed_snapshot(self, edit):
+        p = scenario(self.root / "changed")
+        edit(p)
+        p.write()
 
-        self.assertEqual(config.timezone, "UTC")
-        self.assertEqual(config.brute_force.threshold, 5)
-        self.assertEqual(config.enabled_rules, frozenset(AVAILABLE_RULES))
+        return collect_snapshot(self.root / "changed")
 
-    def test_overrides(self):
-        config = load_config(self.write(
-            "timezone: America/Argentina/Buenos_Aires\n"
-            "brute_force:\n  threshold: 3\n  window_minutes: 20\n"
-        ))
+    def test_create_and_load(self):
+        total = create_baseline(self.snapshot, self.path, force=False)
+        loaded = load_baseline(self.path)
 
-        self.assertEqual(config.timezone, "America/Argentina/Buenos_Aires")
-        self.assertEqual(config.brute_force.threshold, 3)
-        self.assertEqual(config.brute_force.window_minutes, 20)
+        self.assertEqual(total, len(loaded.entries))
+        self.assertIn(("tcp", 22, "all"), {e.key for e in loaded.entries})
+        self.assertEqual([f for f in compare_baseline(self.snapshot, loaded)], [])
 
-    def test_invalid_configuration(self):
-        for text in (
-            "unknown_key: 1\n",
-            "timezone: Not/AZone\n",
-            "brute_force:\n  threshold: 0\n  window_minutes: 5\n",
-            "brute_force: 5\n",
-            "- a list\n",
-        ):
-            with self.subTest(text=text):
-                with self.assertRaises(ValueError):
-                    load_config(self.write(text))
+    def test_existing_baseline_is_protected(self):
+        create_baseline(self.snapshot, self.path, force=False)
+
+        with self.assertRaises(NetworkError):
+            create_baseline(self.snapshot, self.path, force=False)
+
+        create_baseline(self.snapshot, self.path, force=True)
+
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["baseline.json"])
+
+    def test_new_listeners(self):
+        create_baseline(self.snapshot, self.path, force=False)
+
+        def edit(p):
+            p.process(1300, "python3", "/usr/bin/python3", "python3 -m http.server", 1000)
+            p.socket("tcp", (ANY, 8000), (ANY, 0), "0A", 1300, 1000)
+            p.socket("tcp", ("127.0.0.1", 3000), (ANY, 0), "0A")
+
+        findings = compare_baseline(self.changed_snapshot(edit), load_baseline(self.path))
+        severities = {f.subject: f.severity for f in findings if f.rule_id == "NC-004"}
+
+        self.assertEqual(severities["tcp 0.0.0.0:8000"], "HIGH")
+        self.assertEqual(severities["tcp 127.0.0.1:3000"], "MEDIUM")
+
+    def test_exposure_wider_than_the_baseline(self):
+        create_baseline(self.snapshot, self.path, force=False)
+
+        def edit(p):
+            p.rows["tcp"] = [r for r in p.rows["tcp"] if "0100007F:1538" not in r]
+            p.socket("tcp", (ANY, 5432), (ANY, 0), "0A", 210, 114)
+
+        findings = compare_baseline(self.changed_snapshot(edit), load_baseline(self.path))
+        wider = [f for f in findings if "exposed beyond" in f.title]
+
+        self.assertEqual(len(wider), 1)
+        self.assertEqual(wider[0].severity, "HIGH")
+        # The loopback listener that "disappeared" is not reported again.
+        self.assertEqual([f for f in findings if f.rule_id == "NC-005"], [])
+
+    def test_service_stopped_and_process_changed(self):
+        create_baseline(self.snapshot, self.path, force=False)
+
+        def edit(p):
+            p.rows["tcp"] = [r for r in p.rows["tcp"] if ":0016 " not in r.split()[1] + " "]
+            p.rows["tcp6"] = [r for r in p.rows["tcp6"] if ":0016 " not in r.split()[1] + " "]
+            p.rows["tcp"] = [r for r in p.rows["tcp"] if not r.split()[1].endswith(":01BB")]
+            p.process(1500, "haproxy", "/usr/sbin/haproxy", "haproxy", 0)
+            p.socket("tcp", (ANY, 443), (ANY, 0), "0A", 1500)
+
+        findings = compare_baseline(self.changed_snapshot(edit), load_baseline(self.path))
+
+        self.assertEqual([f.subject for f in findings if f.rule_id == "NC-005"], ["tcp 22"])
+        changed = [f for f in findings if "now served by" in f.title]
+
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].severity, "MEDIUM")
+
+    def test_invalid_files(self):
+        self.path.parent.mkdir(exist_ok=True)
+
+        for content in ("not json", '{"version": 1, "entries": [{"proto": "tcp"}]}',
+                        '{"version": 9, "entries": []}', "[]"):
+            with self.subTest(content=content):
+                self.path.write_text(content)
+
+                with self.assertRaises(NetworkError):
+                    load_baseline(self.path)
+
+        with self.assertRaises(NetworkError):
+            load_baseline(self.root / "missing.json")
 
 
-class CommandLineTests(LogTestCase):
-    def test_analyze_and_export_json(self):
-        log = self.write_log([failed_login(minute, "198.51.100.7") for minute in range(6)])
-        config = self.root / "config.yaml"
-        config.write_text(f"ip_history_path: {self.baseline_path}\n")
-        report = self.root / "report.json"
+class WatchTests(NetworkTestCase):
+    def run_watch(self, snapshots, include_loopback=False, log=None, base=None):
+        output = []
+        feed = iter(snapshots)
 
-        code, output = run_cli(
-            "logs", "--config", config, "analyze", log,
-            "--year", 2026, "--json", report,
+        with mock.patch.object(watch, "collect_snapshot", side_effect=lambda root: next(feed)), \
+                mock.patch.object(watch.time, "sleep"):
+            totals = watch.watch(
+                Path("/unused"), 1.0, len(snapshots), log, include_loopback, base, output.append
+            )
+
+        return totals, output
+
+    def snapshot_with(self, edit):
+        p = scenario(self.root / "w")
+        edit(p)
+        p.write()
+
+        return collect_snapshot(self.root / "w")
+
+    def test_reports_new_and_closed_sockets_with_alerts(self):
+        def add(p):
+            p.process(2000, "bash", "/usr/bin/bash", "bash -i", 1000)
+            p.socket("tcp", ("192.0.2.10", 53000), ("8.8.4.4", 9001), "01", 2000, 1000)
+            p.process(2100, "redis-server", "/usr/bin/redis-server", "redis-server", 999)
+            p.socket("tcp", (ANY, 6379), (ANY, 0), "0A", 2100, 999)
+
+        first = self.snapshot
+        second = self.snapshot_with(add)
+        totals, output = self.run_watch([first, second, first])
+        text = "\n".join(output)
+
+        self.assertEqual(totals["connection_new"], 1)
+        self.assertEqual(totals["connection_closed"], 1)
+        self.assertIn("CONNECTION NEW tcp 192.0.2.10:53000 -> 8.8.4.4:9001 (bash", text)
+        self.assertIn("NC-009", text)
+        self.assertIn("CONNECTION CLOSED", text)
+
+    def test_local_connections_are_ignored_unless_requested(self):
+        def add(p):
+            p.socket("tcp", ("127.0.0.1", 40000), ("127.0.0.1", 5432), "01")
+
+        second = self.snapshot_with(add)
+
+        self.assertEqual(self.run_watch([self.snapshot, second])[0]["connection_new"], 0)
+        self.assertEqual(
+            self.run_watch([self.snapshot, second], include_loopback=True)[0]["connection_new"], 1
         )
+
+    def test_events_are_logged_as_json_lines(self):
+        def add(p):
+            p.socket("tcp", ("192.0.2.10", 53000), ("8.8.4.4", 9001), "01")
+
+        log = self.root / "logs" / "events.jsonl"
+        self.run_watch([self.snapshot, self.snapshot_with(add)], log=log)
+
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+
+        self.assertEqual(records[0]["event"], "connection_new")
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+
+    def test_new_listeners_are_compared_with_the_baseline(self):
+        path = self.root / "watch-baseline.json"
+        create_baseline(self.snapshot, path, force=True)
+
+        def add(p):
+            p.socket("tcp", (ANY, 8000), (ANY, 0), "0A")
+
+        _, output = self.run_watch(
+            [self.snapshot, self.snapshot_with(add)], base=load_baseline(path)
+        )
+
+        self.assertIn("NC-004", "\n".join(output))
+
+    def test_interrupt_stops_cleanly(self):
+        with mock.patch.object(watch, "collect_snapshot", return_value=self.snapshot), \
+                mock.patch.object(watch.time, "sleep", side_effect=KeyboardInterrupt):
+            output = []
+            watch.watch(Path("/unused"), 1.0, 0, None, False, None, output.append)
+
+        self.assertIn("Stopped.", "\n".join(output))
+
+
+class CommandLineTests(NetworkTestCase):
+    def run_scan(self, *args):
+        return run_module("src.network", "scan", "--proc-root", self.root / "proc", *args)
+
+    def test_report(self):
+        code, output = self.run_scan("--min-severity", "high")
 
         self.assertEqual(code, 0, output)
-        self.assertIn("brute-force", output.lower())
+        self.assertIn("Listening sockets (", output)
+        self.assertIn("NC-001", output)
+        self.assertNotIn("NC-006", output)
+
+    def test_it_is_also_available_in_the_toolkit_cli(self):
+        from tests.helpers import run_cli
+
+        code, output = run_cli("network", "scan", "--proc-root", self.root / "proc", "--listening")
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("Redis", output)
+
+    def test_fail_on_gives_exit_code_1(self):
+        self.assertEqual(self.run_scan("--fail-on", "critical")[0], 1)
+        self.assertEqual(self.run_scan("--fail-on", "critical", "--max-per-ip", "500")[0], 1)
+
+    def test_clean_system_does_not_fail(self):
+        p = FakeProc(self.root / "clean")
+        p.process(300, "sshd", "/usr/sbin/sshd", "sshd", 0)
+        p.socket("tcp", (ANY, 22), (ANY, 0), "0A", 300)
+        p.write()
+
+        code, output = run_module("src.network", "scan", "--proc-root", self.root / "clean", "--fail-on", "low")
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("No findings.", output)
+
+    def test_json_export(self):
+        report = self.root / "scan.json"
+
+        self.run_scan("--json", report, "--min-severity", "high")
         data = json.loads(report.read_text())
-        self.assertEqual([f["rule_id"] for f in data["findings"]], ["brute_force"])
-        self.assertIn("warnings", data)
 
-    def test_errors_are_reported_with_exit_code_2(self):
-        code, output = run_cli("logs", "analyze", self.root / "missing.log")
+        self.assertEqual(data["summary"]["listeners"], len(data["listeners"]))
+        self.assertTrue(all(f["severity"] in ("HIGH", "CRITICAL") for f in data["findings"]))
+        self.assertEqual(
+            [item["process"]["name"] for item in data["listeners"] if item["local_port"] == 6379],
+            ["redis-server"],
+        )
 
-        self.assertNotEqual(code, 0)
-        self.assertIn("Error", output)
+    def test_remote_addresses_are_printed_one_per_line(self):
+        p = FakeProc(self.root / "remote")
+        p.socket("tcp", ("192.0.2.10", 1), ("8.8.8.8", 443), "01")
+        p.socket("tcp6", ("2001:db8::10", 2), ("2606:4700:4700::1111", 443), "01")
+        p.write()
 
-    def test_baseline_management(self):
-        config = self.root / "config.yaml"
-        config.write_text(f"ip_history_path: {self.baseline_path}\n")
-
-        self.assertEqual(run_cli("logs", "--config", config, "ips", "init")[0], 0)
-        self.assertNotEqual(run_cli("logs", "--config", config, "ips", "init")[0], 0)
-        run_cli("logs", "--config", config, "ips", "approve", "10.0.0.5")
-
-        code, output = run_cli("logs", "--config", config, "ips", "list")
+        code, output = run_module("src.network", "scan", "--proc-root", self.root / "remote", "--remote-ips")
 
         self.assertEqual(code, 0)
-        self.assertIn("10.0.0.5", output)
+        self.assertEqual(output.split(), ["8.8.8.8", "2606:4700:4700::1111"])
+
+    def test_baseline_commands(self):
+        path = self.root / "cli-baseline.json"
+
+        code, output = run_module("src.network", "baseline", "create", "--proc-root", self.root / "proc", "--path", path)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(run_module("src.network", "baseline", "create", "--proc-root", self.root / "proc", "--path", path)[0], 2)
+
+        code, output = run_module("src.network", "baseline", "show", "--path", path)
+        self.assertIn("Expected listeners:", output)
+
+        code, output = self.run_scan("--baseline", path, "--listening")
+        self.assertNotIn("NC-004", output)
+
+    def test_invalid_usage(self):
+        for args in (("--listening", "--established"), ("--limit", "0"), ("--baseline", "/nope.json")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_scan(*args)[0], 2)
+
+        self.assertEqual(run_module("src.network", "watch", "--interval", "0.1")[0], 2)
+
+    def test_pipelines_can_close_early(self):
+        """A reader such as "head" may close the pipe before the end."""
+        import subprocess
+        import sys
+        from tests.helpers import PROJECT_ROOT, project_env
+
+        driver = (
+            "import sys, time\n"
+            "from src.network import cli\n"
+            "def noisy(*args, **kwargs):\n"
+            "    print('x' * 100)\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(1)\n"
+            "    print('tail')\n"
+            "cli.print_scan = noisy\n"
+            "if sys.argv[1] == 'standalone':\n"
+            "    cli.main(['scan', '--proc-root', sys.argv[2]])\n"
+            "else:\n"
+            "    sys.argv = ['security-toolkit', 'network', 'scan',\n"
+            "                '--proc-root', sys.argv[2]]\n"
+            "    from src.cli import main\n"
+            "    main()\n"
+        )
+
+        # Buffered output, as in a normal terminal session.
+        environment = project_env()
+        environment.pop("PYTHONUNBUFFERED", None)
+
+        for mode in ("standalone", "integrated"):
+            with self.subTest(mode=mode):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", driver, mode, str(self.root / "proc")],
+                    cwd=PROJECT_ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                process.stdout.read(10)
+                process.stdout.close()
+                code = process.wait(timeout=30)
+
+                with process.stderr:
+                    errors = process.stderr.read().decode()
+
+                self.assertEqual(code, 0, errors)
+                self.assertNotIn("Traceback", errors)
+                self.assertNotIn("Exception ignored", errors)
 
 
 if __name__ == "__main__":

@@ -151,19 +151,32 @@ def analyze_rules(info: URLInfo) -> list[Finding]:
         )
 
     if not info.is_ip:
-        scripts = set()
+        # Each label of a legitimate domain normally uses one script.
+        # ASCII letters count as Latin, so a Cyrillic letter inside an
+        # otherwise Latin label (paypal with a Cyrillic "a") is detected.
+        mixed_label = False
 
-        for char in info.unicode_hostname:
-            if not char.isalpha() or ord(char) < 128:
-                continue
+        for label in info.unicode_hostname.split("."):
+            scripts = set()
 
-            name = unicodedata.name(char, "")
+            for char in label:
+                if not char.isalpha():
+                    continue
 
-            for script in ("LATIN", "CYRILLIC", "GREEK"):
-                if script in name:
-                    scripts.add(script)
+                if ord(char) < 128:
+                    scripts.add("LATIN")
+                    continue
 
-        if len(scripts) > 1:
+                name = unicodedata.name(char, "")
+
+                for script in ("LATIN", "CYRILLIC", "GREEK"):
+                    if script in name:
+                        scripts.add(script)
+
+            if len(scripts) > 1:
+                mixed_label = True
+
+        if mixed_label:
             add(
                 "MIXED_SCRIPT",
                 "HIGH",

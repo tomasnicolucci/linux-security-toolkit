@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 
 from src.password.cli import register_password_commands
 from src.url.cli import register_url_commands
@@ -34,6 +36,11 @@ def main() -> None:
 
     try:
         args.func(args)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader of a pipe (for example "head") closed early.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0)
     except (ValueError, OSError) as error:
         parser.exit(2, f"Error: {error}\n")
 

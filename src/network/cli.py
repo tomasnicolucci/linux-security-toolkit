@@ -274,6 +274,9 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         args.func(args)
+        # Output is buffered; flushing here makes a closed pipe show up
+        # inside this block instead of while the interpreter exits.
+        sys.stdout.flush()
     except BrokenPipeError:
         # The reader of a pipe (for example "head") closed early.
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())

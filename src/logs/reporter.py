@@ -1,7 +1,7 @@
 import json
 from collections import Counter
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 

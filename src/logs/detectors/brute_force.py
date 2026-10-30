@@ -1,6 +1,5 @@
 
 from collections import defaultdict
-from datetime import timedelta
 
 from src.logs.config import LogAnalyzerConfig
 from src.logs.correlation import (

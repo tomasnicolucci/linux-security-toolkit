@@ -20,4 +20,4 @@ mallory:x:1006:
 frank:x:1008:
 ops:x:1100:carol
 legacy:x:1100:
-devs:x:1101:bob,dave    
+devs:x:1101:bob,dave

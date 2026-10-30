@@ -1,5 +1,4 @@
 import ipaddress
-import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, SplitResult
 
