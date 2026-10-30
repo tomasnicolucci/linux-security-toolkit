@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff>=0.8,<1"
+      - run: ruff check .
+
+  shellcheck:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-latest
+    # Informative for now: review the warnings before making it blocking.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning src/users/user_auditor.sh
+
+  tests:
+    name: Tests (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --cov=src --cov-report=term-missing
+
+  docker:
+    name: Docker image and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the tests inside the image
+        run: |
+          docker build --target test -t toolkit-test .
+          docker run --rm toolkit-test
+      - name: Build the final image and check it starts
+        run: |
+          docker build -t toolkit .
+          docker run --rm toolkit --help
