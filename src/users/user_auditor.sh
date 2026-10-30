@@ -54,7 +54,7 @@ declare -a USERS=() GROUP_NAMES=() WARNINGS=() ERRORS=()
 declare -a F_SEV=() F_ID=() F_SUBJECT=() F_TITLE=() F_DETAIL=() F_REC=()
 
 declare -A PW_PASS=() PW_UID=() PW_GID=() PW_GECOS=() PW_HOME=() PW_SHELL=()
-declare -A SH_HASH=() SH_LASTCHG=() SH_MIN=() SH_MAX=() SH_WARN=() SH_INACTIVE=() SH_EXPIRE=()
+declare -A SH_HASH=() SH_LASTCHG=() SH_MAX=() SH_EXPIRE=()
 declare -A GR_GID=() GR_MEMBERS=()
 declare -A UID_OWNERS=() GID_OWNERS=() FIRST_USER_OF_UID=() FIRST_GROUP_OF_GID=() GID_PRIMARY_USERS=()
 declare -A LOGIN_DEFS=() SSHD=()
@@ -332,7 +332,7 @@ parse_passwd() {
 }
 
 parse_shadow() {
-    local file line lineno=0 colons name hash lastchg min max warn inactive expire reserved
+    local file line lineno=0 colons name hash lastchg max expire
     file=$(p etc/shadow)
 
     if [[ ! -r $file ]]; then
@@ -356,7 +356,7 @@ parse_shadow() {
             continue
         fi
 
-        IFS=: read -r name hash lastchg min max warn inactive expire reserved <<< "$line"
+        IFS=: read -r name hash lastchg _ max _ _ expire _ <<< "$line"
         name=${name//[[:cntrl:]]/?}
 
         if ! valid_name "$name"; then
@@ -369,10 +369,7 @@ parse_shadow() {
 
         SH_HASH[$name]=${hash//[[:cntrl:]]/?}
         SH_LASTCHG[$name]=$lastchg
-        SH_MIN[$name]=$min
         SH_MAX[$name]=$max
-        SH_WARN[$name]=$warn
-        SH_INACTIVE[$name]=$inactive
         SH_EXPIRE[$name]=$expire
     done < "$file"
 }
@@ -498,7 +495,7 @@ hash_info() {
             *) H_ALGO="des"; H_WEAK=1 ;;
         esac
 
-        if (( locked )); then H_STATE=locked; else H_STATE=hash; fi
+        if (( locked )); then H_STATE="locked"; else H_STATE="hash"; fi
     else
         H_STATE=locked
     fi
@@ -574,7 +571,7 @@ evaluate_accounts() {
 }
 
 check_accounts() {
-    local u uid gid state type login weak algo pw max lastchg age note
+    local u uid gid state type login weak algo pw max lastchg age
 
     for u in "${USERS[@]}"; do
         uid=${PW_UID[$u]}
@@ -1379,7 +1376,7 @@ check_homes() {
 
         if [[ -d $ssh_dir ]]; then
             if mode=$(stat -L -c '%a' -- "$ssh_dir" 2>/dev/null) && (( 8#$mode & 8#077 )); then
-                add_finding MEDIUM UA-063 "$u" "~/.ssh of '$u' is accessible by others (mode $mode)" \
+                add_finding MEDIUM UA-063 "$u" "The .ssh directory of '$u' is accessible by others (mode $mode)" \
                     "SSH may refuse keys and other users can read private material." \
                     "Run chmod 700 $home/.ssh."
             fi
