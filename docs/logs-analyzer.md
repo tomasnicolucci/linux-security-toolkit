@@ -221,7 +221,7 @@ The baseline is stored at:
 data/logs/known_ips.json
 ```
 
-When no approved baseline exists, unknown-IP detection is skipped. An explicitly initialized empty baseline means that no IP addresses have been approved.
+When no approved baseline exists, unknown-IP detection is skipped and the report shows a warning (also included in the JSON export). An explicitly initialized empty baseline means that no IP addresses have been approved.
 
 ## Report Output
 
@@ -245,13 +245,15 @@ The analyzer identifies suspicious patterns. A finding does not necessarily conf
 
 Some important limitations:
 
-- Traditional syslog timestamps do not contain a year or timezone.
+- Traditional syslog timestamps do not contain a year or timezone. Use `--year`; timestamps without an offset (syslog and ISO 8601) are interpreted in the configured timezone.
 - Authentication logs may contain multiple records for one login attempt.
 - IP-based attribution can be affected by NAT, VPNs, proxies, or shared networks.
 - An approved IP address does not guarantee that activity from that address is legitimate.
 - Analysis is limited to the available log files and their contents.
 - The analyzer does not continuously monitor logs.
 - It does not automatically block IP addresses or change server configuration.
+- Month names in Spanish (`Ene`, `Abr`, `Ago`, `Dic`) are accepted; lines with any other unknown month are reported as errors and skipped.
+- Failed `sudo` attempts (wrong password or user not in sudoers) are recognized even though the log line also names the refused command.
 
 ## Security Considerations
 
@@ -287,8 +289,13 @@ src/
         └── service_errors.py
 ```
 
+## Related modules
+
+- The [IP Analyzer](ip-analyzer.md) can analyze every address mentioned in a JSON report with `ip analyze --from-report`, and shares the approved IP baseline with this module.
+- [Security Events Statistics](security-events-statistics.md) reads logs with the same reader and parser, so both modules count exactly the same events.
+
 ## Module Status
 
-Implementation files have been provided. Full integration and functional verification are still pending.
+Implemented and covered by automated tests (`tests/test_logs.py`), including detectors, parsing, filters, configuration validation and the command line. Analysis time grows linearly with the size of the logs.
 
 Automated tests are outside the current implementation scope and can be added separately.
