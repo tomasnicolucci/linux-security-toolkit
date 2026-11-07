@@ -16,6 +16,7 @@ htmlcov/
 data/integrity/*.json
 data/logs/*.json
 data/network/
+data/audit/
 data/encryption/
 
 # Keys and encrypted files must never be committed

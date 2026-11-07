@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 
+from src.audit.cli import register_audit_commands
 from src.password.cli import register_password_commands
 from src.url.cli import register_url_commands
 from src.encryption.cli import register_encryption_commands
@@ -10,6 +11,7 @@ from src.ip.cli import register_ip_commands
 from src.logs.cli import register_logs_commands
 from src.network.cli import register_network_commands
 from src.statistics.cli import register_stats_commands
+from src.users.cli import register_users_commands
 
 
 def main() -> None:
@@ -31,6 +33,8 @@ def main() -> None:
     register_stats_commands(commands)
     register_encryption_commands(commands)
     register_network_commands(commands)
+    register_users_commands(commands)
+    register_audit_commands(commands)
 
     args = parser.parse_args()
 

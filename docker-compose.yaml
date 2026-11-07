@@ -31,6 +31,22 @@ services:
     volumes:
       - ./data:/app/data
 
+  audit:
+    build: .
+    image: linux-security-toolkit
+    entrypoint: ["python", "-m", "src.cli", "audit"]
+    network_mode: host
+    pid: host
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - ./data:/app/data
+      - ./samples:/app/samples:ro
+      - ./config.yaml:/app/config.yaml:ro
+      - /etc:/host/etc:ro
+      # Optional, to audit the authentication log with --logs:
+      # - /var/log:/host/var/log:ro
+
   tests:
     build:
       context: .
