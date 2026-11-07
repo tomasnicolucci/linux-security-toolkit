@@ -51,6 +51,14 @@ docker compose run --rm user-auditor --root /host
 
 On Docker Desktop (Windows or macOS), `/etc` belongs to the Docker virtual machine, not to your computer. Use the sample files to try the tool there and run it on a real server for real audits.
 
+From the toolkit command line, `users audit` runs the same script with the same options:
+
+```bash
+docker compose run --rm security-toolkit users audit --root /app/samples/system --no-permission-checks
+```
+
+The [consolidated audit](audit-report.md) also runs it together with the network, file integrity and log checks.
+
 ## Options
 
 | Option | Description |
@@ -145,7 +153,8 @@ By default the auditor never prints password hashes: it reports only the algorit
 ```text
 src/
 └── users/
-    └── user_auditor.sh
+    ├── user_auditor.sh
+    └── cli.py
 samples/
 └── system/
     └── etc/

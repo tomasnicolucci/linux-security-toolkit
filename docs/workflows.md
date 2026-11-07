@@ -70,13 +70,30 @@ docker compose run --rm security-toolkit encryption info /app/data/logs/report.j
 
 The password is requested on the terminal and is never accepted as a command line argument. The original file is not deleted.
 
+## 5. Audit everything and track what changes
+
+The consolidated audit runs the user, network, file integrity and log checks together and writes one report.
+
+```bash
+# First audit
+docker compose run --rm audit run --root /host
+
+# Later: compare with the previous audit
+docker compose run --rm audit run --root /host --previous latest
+```
+
+The second report marks every finding as new or unchanged and lists the ones that were resolved. See the [guide](audit-report.md) for the options and for how coverage is reported.
+
 ## Running checks on a schedule
 
-`scan`, `integrity check` and the User Auditor return a non-zero exit code when they find problems, which makes them easy to run from `cron` or a systemd timer:
+`scan`, `integrity check`, the User Auditor and the consolidated audit return a non-zero exit code when they find problems, which makes them easy to run from `cron` or a systemd timer:
 
 ```bash
 # Every day at 06:00: run the scan; the exit code is 1 when something HIGH or worse appears
 0 6 * * * cd /opt/linux-security-toolkit && docker compose run --rm -T network-monitor scan --baseline --fail-on HIGH
+
+# Every day at 07:00: full audit compared with the previous one
+0 7 * * * cd /opt/linux-security-toolkit && docker compose run --rm -T audit run --root /host --previous latest --fail-on HIGH
 ```
 
 | Command | Exit code 0 | Exit code 1 | Exit code 2 |
@@ -84,3 +101,4 @@ The password is requested on the terminal and is never accepted as a command lin
 | `network scan --fail-on LEVEL` | No finding at that level | A finding reached the level | Error |
 | `user-auditor --fail-on LEVEL` | No finding at that level | A finding reached the level | Error |
 | `integrity check` | No changes | Changes detected | Error |
+| `audit run --fail-on LEVEL` | No finding at that level | A finding reached the level | Error, or no module could be audited |
